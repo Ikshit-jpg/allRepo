@@ -1,0 +1,282 @@
+.rating-body {
+    font-family: "Space Grotesk", sans-serif;
+    background: #04070f;
+    color: #f5fbff;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 32px 16px 48px 16px;
+    position: relative;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+
+.rating-wrap {
+    position: relative;
+    z-index: 1;
+}
+
+.plasma-container {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+}
+
+.rating-body.plasma-fallback {
+    background:
+        radial-gradient(circle at 15% 20%, rgba(140, 90, 255, 0.35), rgba(0,0,0,0) 45%),
+        radial-gradient(circle at 80% 25%, rgba(80, 200, 255, 0.3), rgba(0,0,0,0) 45%),
+        radial-gradient(circle at 20% 85%, rgba(255, 140, 200, 0.28), rgba(0,0,0,0) 48%),
+        radial-gradient(circle at 85% 80%, rgba(120, 255, 200, 0.22), rgba(0,0,0,0) 50%),
+        #04070f;
+    animation: plasmaFallback 18s ease-in-out infinite alternate;
+}
+
+@keyframes plasmaFallback {
+    0% { background-position: 0% 0%, 100% 0%, 0% 100%, 100% 100%; }
+    100% { background-position: 10% 5%, 90% 15%, 8% 92%, 95% 88%; }
+}
+
+.rating-wrap {
+    width: min(1100px, 95vw);
+}
+
+.rating-header {
+    text-align: center;
+    margin-bottom: 24px;
+    padding-top: 10px;
+}
+
+.rating-badge {
+    display: inline-block;
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    background: rgba(180, 230, 255, 0.14);
+    border: 1px solid rgba(180, 230, 255, 0.4);
+}
+
+.rating-title {
+    font-family: "Orbitron", sans-serif;
+    font-size: clamp(2rem, 4vw, 3rem);
+    margin: 10px 0 6px 0;
+    letter-spacing: 0.12em;
+}
+
+.rating-subtitle {
+    opacity: 0.85;
+}
+
+.rating-panel {
+    display: grid;
+    grid-template-columns: minmax(320px, 1.2fr) minmax(220px, 0.8fr);
+    gap: 20px;
+}
+
+.rating-card {
+    background: rgba(16, 24, 36, 0.72);
+    border: 1px solid rgba(180, 220, 255, 0.25);
+    border-radius: 20px;
+    padding: 24px;
+    box-shadow: 0 18px 38px rgba(0, 0, 0, 0.35);
+}
+
+.rating-card h2 {
+    margin-bottom: 10px;
+}
+
+.rating-label {
+    display: block;
+    margin: 12px 0 6px 0;
+    font-size: 0.85rem;
+    opacity: 0.9;
+}
+
+.rating-stars {
+    display: flex;
+    gap: 8px;
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    margin-bottom: 14px;
+}
+
+.rating-stars input {
+    display: none;
+}
+
+.rating-stars label {
+    font-size: 1.8rem;
+    cursor: pointer;
+    color: rgba(255, 255, 255, 0.25);
+    transition: color 0.2s ease, transform 0.2s ease;
+}
+
+.rating-stars input:checked ~ label,
+.rating-stars label:hover,
+.rating-stars label:hover ~ label {
+    color: #8fd8ff;
+    transform: scale(1.05);
+}
+
+textarea#previewText {
+    width: 100%;
+    min-height: 120px;
+    resize: vertical;
+    border-radius: 14px;
+    border: 1px solid rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.05);
+    color: #fff;
+    padding: 12px;
+    outline: none;
+}
+
+input#userName {
+    width: 100%;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.05);
+    color: #fff;
+    padding: 10px 12px;
+    outline: none;
+}
+
+.rating-actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-top: 16px;
+}
+
+#sendRating {
+    background: #f5fbff;
+    color: #111;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 999px;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+ .tip-button {
+    position: fixed;
+    top: 18px;
+    right: 18px;
+    z-index: 1000;
+    width: 44px;
+    height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1.5px solid rgba(170, 225, 255, 0.6);
+    color: #e8f7ff;
+    padding: 0;
+    border-radius: 10px;
+    text-decoration: none;
+    font-size: 1rem;
+    backdrop-filter: blur(6px);
+    box-shadow:
+        0 0 10px rgba(120, 200, 255, 0.45),
+        0 0 20px rgba(120, 200, 255, 0.22);
+    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.tip-button:hover {
+    transform: translateY(-1px) scale(1.02);
+    border-color: rgba(200, 240, 255, 0.9);
+    box-shadow:
+        0 0 14px rgba(140, 220, 255, 0.6),
+        0 0 26px rgba(140, 220, 255, 0.35);
+}
+
+.tip-icon {
+    font-size: 1.1rem;
+    line-height: 1;
+}
+
+.rating-side {
+    border-radius: 18px;
+    padding: 20px;
+    background: rgba(12, 18, 28, 0.7);
+    border: 1px solid rgba(150, 210, 255, 0.2);
+}
+
+.rating-side ul {
+    padding-left: 18px;
+    margin-top: 10px;
+}
+
+.rating-side li {
+    margin-bottom: 8px;
+}
+
+.rating-note {
+    margin-top: 12px;
+    font-size: 0.8rem;
+    opacity: 0.8;
+}
+
+.tip-button {
+    position: fixed;
+    top: 18px;
+    right: 18px;
+    z-index: 1000;
+    background: rgba(255,255,255,0.12);
+    border: 1px solid rgba(180,220,255,0.4);
+    color: #e8f7ff;
+    padding: 8px 14px;
+    border-radius: 999px;
+    text-decoration: none;
+    font-size: 0.8rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    backdrop-filter: blur(8px);
+}
+
+@media (max-width: 800px) {
+    .rating-panel {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 600px) {
+    .rating-body {
+        padding: 30px 16px 42px 16px;
+    }
+
+    .rating-title {
+        font-size: 1.8rem;
+    }
+
+    .rating-panel {
+        gap: 18px;
+    }
+
+    .rating-card {
+        padding: 22px;
+    }
+
+    textarea#previewText {
+        min-height: 120px;
+        padding: 12px;
+    }
+
+    input#userName {
+        padding: 10px 12px;
+    }
+
+    #sendRating {
+        padding: 11px 20px;
+    }
+
+    .tip-button {
+        width: 40px;
+        height: 40px;
+        top: 14px;
+        right: 14px;
+    }
+}

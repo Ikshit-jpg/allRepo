@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARCHIVE Preview Rating</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="rating.css">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+    <link rel="icon" href="data:,">
+</head>
+<body class="rating-body plasma-fallback">
+    <a class="tip-button" href="index.html" aria-label="Back to ARCHIVE">
+        <span class="tip-icon" aria-hidden="true">←</span>
+    </a>
+    <div class="rating-wrap">
+        <header class="rating-header">
+            <p class="rating-badge">Preview Rating</p>
+            <h1 class="rating-title">ARCHIVE Feedback Studio</h1>
+            <p class="rating-subtitle">Your preview helps shape the best anime editor on the web.</p>
+        </header>
+
+        <main class="rating-panel">
+            <section class="rating-card">
+                <h2>Rate the experience</h2>
+                <div class="rating-stars" role="radiogroup" aria-label="Select rating">
+                    <input type="radio" name="rating" id="star5" value="5">
+                    <label for="star5" title="5 stars">&#9733;</label>
+                    <input type="radio" name="rating" id="star4" value="4">
+                    <label for="star4" title="4 stars">&#9733;</label>
+                    <input type="radio" name="rating" id="star3" value="3">
+                    <label for="star3" title="3 stars">&#9733;</label>
+                    <input type="radio" name="rating" id="star2" value="2">
+                    <label for="star2" title="2 stars">&#9733;</label>
+                    <input type="radio" name="rating" id="star1" value="1">
+                    <label for="star1" title="1 star">&#9733;</label>
+                </div>
+
+                <label class="rating-label" for="previewText">Quick preview</label>
+                <textarea id="previewText" placeholder="Tell us what felt powerful, what felt off, and what you want next."></textarea>
+
+                <label class="rating-label" for="userName">Name (optional)</label>
+                <input id="userName" type="text" placeholder="Your name">
+
+                <form id="ratingForm" class="rating-actions" action="https://formspree.io/f/xdawbeok" method="POST">
+                    <input type="hidden" name="rating" id="ratingValue">
+                    <input type="hidden" name="preview" id="previewValue">
+                    <input type="hidden" name="name" id="nameValue">
+                    <button id="sendRating" type="submit">Send Rating</button>
+                </form>
+            </section>
+
+            <aside class="rating-side">
+                <h3>What we value</h3>
+                <ul>
+                    <li>Edits that feel intentional, not random.</li>
+                    <li>Music that actually matches the vibe.</li>
+                    <li>Transitions that feel cinematic, not spammy.</li>
+                </ul>
+                <p class="rating-note">Your message is sent via email on submit.</p>
+            </aside>
+        </main>
+    </div>
+
+    <script>
+        const form = document.getElementById("ratingForm");
+        const sendBtn = document.getElementById("sendRating");
+        form.addEventListener("submit", (event) => {
+            const rating = document.querySelector('input[name="rating"]:checked');
+            const preview = document.getElementById("previewText").value.trim();
+            const name = document.getElementById("userName").value.trim();
+
+            if (!rating) {
+                alert("Please pick a star rating.");
+                event.preventDefault();
+                return;
+            }
+
+            document.getElementById("ratingValue").value = rating.value;
+            document.getElementById("previewValue").value = preview || "No written feedback.";
+            document.getElementById("nameValue").value = name || "Anonymous";
+        });
+    </script>
+</body>
+</html>
