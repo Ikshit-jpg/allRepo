@@ -1007,7 +1007,7 @@ def build_style_profile_from_prompt(prompt: str, mood: str) -> dict[str, Any]:
 
         # Quality & render
         "fast_render":           p.fast_render,
-        "quality_priority":      p.quality or intensity >= 3,
+        "quality_priority":      p.quality,
         "loop_clips":            bool(fx.get("loop_clips",         False)),
         "loop_count":            2,
         "loop_ending":           False,

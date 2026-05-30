@@ -1,0 +1,34 @@
+# Runtime/generated media
+uploads/
+outputs/
+renders/
+runtime/
+artifacts/
+dist/
+
+# Local music/assets are too large for normal Git pushes.
+# Keep a tiny curated sample outside this ignore if needed.
+phonks/
+
+# Compiled native artifacts and vendored runtime binaries
+*.exe
+*.dll
+*.pyd
+*.so
+*.dylib
+cpp/
+ai_editor/build/
+ai_editor/.git/
+
+# Python/Node/cache noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+
+# Local editor/system files
+.vscode/
+.DS_Store
+Thumbs.db

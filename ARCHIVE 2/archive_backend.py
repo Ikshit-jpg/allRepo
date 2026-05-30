@@ -249,6 +249,12 @@ def _bootstrap_bundled_ffmpeg() -> str:
 BOOTSTRAPPED_FFMPEG_EXE = _bootstrap_bundled_ffmpeg()
 ARCHIVE_BRAIN_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TIMEOUT_SEC", "420")))
 ARCHIVE_EXTERNAL_EFFECT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_EXTERNAL_EFFECT_TIMEOUT_SEC", "90")))
+ARCHIVE_SPEED_MODE = os.getenv("ARCHIVE_SPEED_MODE", "1").strip().lower() in {"1", "true", "yes", "on"}
+ARCHIVE_DEFAULT_FAST_RENDER = os.getenv("ARCHIVE_DEFAULT_FAST_RENDER", "1").strip().lower() in {"1", "true", "yes", "on"}
+ARCHIVE_DEFAULT_BRAIN_RENDER = os.getenv("ARCHIVE_DEFAULT_BRAIN_RENDER", "0").strip().lower() in {"1", "true", "yes", "on"}
+ARCHIVE_FAST_MAX_DURATION_SEC = float(os.getenv("ARCHIVE_FAST_MAX_DURATION_SEC", "30"))
+ARCHIVE_FAST_MAX_PIXELS = int(float(os.getenv("ARCHIVE_FAST_MAX_PIXELS", str(1920 * 1080))))
+ARCHIVE_QUALITY_MAX_PIXELS = int(float(os.getenv("ARCHIVE_QUALITY_MAX_PIXELS", str(3840 * 2160))))
 
 # --- Upload validation: 500 MB hard ceiling ---
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("ARCHIVE_MAX_UPLOAD_MB", "500")) * 1024 * 1024
@@ -2085,12 +2091,93 @@ def _default_always_on_effects(mood: str) -> list[str]:
 def _max_render_pixels(style: dict[str, Any], *, fallback_pixels: int = 3840 * 2160) -> int:
     """
     Target output ceiling for timeline renders.
-    Default now preserves up to 4K to avoid unintended 720p/1080p downscales.
+    Speed mode keeps common renders near 1080p; quality mode can still preserve 4K.
     """
+    if bool(style.get("quality_priority", False)):
+        return ARCHIVE_QUALITY_MAX_PIXELS
     if bool(style.get("fast_render", False)) and (not bool(style.get("quality_priority", False))):
-        # Keep fast mode lighter but still above 1080p.
-        return 2560 * 1440
+        return ARCHIVE_FAST_MAX_PIXELS
     return fallback_pixels
+
+
+def _apply_performance_defaults(prompt: str, style_profile: dict[str, Any]) -> dict[str, Any]:
+    """
+    Keep the default UX fast. Heavy engines are still available when explicitly requested.
+    """
+    profile = dict(style_profile or {})
+    if not ARCHIVE_SPEED_MODE:
+        profile.setdefault("brain_render", ARCHIVE_DEFAULT_BRAIN_RENDER)
+        return profile
+
+    text = (prompt or "").lower()
+    heavy_requested = any(
+        token in text
+        for token in (
+            "all effects",
+            "everything",
+            "max effects",
+            "maximum quality",
+            "highest quality",
+            "quality priority",
+            "pro pack",
+            "pro edit",
+            "brain render",
+            "elite brain",
+            "master brain",
+            "4k",
+        )
+    )
+    fast_requested = any(
+        token in text
+        for token in (
+            "fast render",
+            "quick render",
+            "minimum time",
+            "low time",
+            "faster",
+            "speed mode",
+        )
+    )
+
+    if ARCHIVE_DEFAULT_FAST_RENDER or fast_requested:
+        profile["fast_render"] = True
+        profile["disable_fast_renderer"] = False
+
+    if not heavy_requested:
+        explicit_effects = set(profile.get("explicit_effects", []) or [])
+        if int(profile.get("intensity", 2) or 2) > 2 and not any(
+            token in text for token in ("intense", "insane", "hard", "aggressive", "maximum", "all effects")
+        ):
+            profile["intensity"] = 2
+        for key in (
+            "overlap_transitions",
+            "mask_transition",
+            "loop_clips",
+            "loop_ending",
+            "particles",
+            "energy_aura",
+            "turbulent",
+            "turbulent_displace",
+            "blend_overlay",
+            "mask_roto",
+            "chroma_key",
+            "difference_matte",
+            "object_inpaint",
+            "fire_lines",
+            "boomerang",
+            "pro_edit_pack",
+        ):
+            if key not in explicit_effects:
+                profile[key] = False
+        profile["quality_priority"] = False
+        profile["brain_render"] = ARCHIVE_DEFAULT_BRAIN_RENDER
+        profile["heavy_effects_engine"] = False
+    else:
+        profile["brain_render"] = ARCHIVE_DEFAULT_BRAIN_RENDER or any(
+            token in text for token in ("brain render", "elite brain", "master brain")
+        )
+
+    return profile
 
 
 def _enforce_high_energy_style(prompt: str, mood: str, style_profile: dict[str, Any]) -> dict[str, Any]:
@@ -7148,6 +7235,8 @@ def render_video_with_moviepy(
     audio_features: dict[str, Any] | None = None,
 ) -> float:
     style = build_style_profile(prompt_text, mood)
+    style = _enforce_high_energy_style(prompt_text, mood, style)
+    style = _apply_performance_defaults(prompt_text, style)
     intensity = int(style.get("intensity", 1))
     if bool(style.get("pro_edit_pack", False)) and (not bool(style.get("simple_mode", False))):
         if not bool(style.get("overlap_transitions", False)):
@@ -7199,12 +7288,13 @@ def render_video_with_moviepy(
             app.logger.warning("Fast FFmpeg renderer failed, falling back to MoviePy: %s", fast_exc)
 
     with VideoFileClip(str(video_path)) as clip:
-        duration = min(float(clip.duration or 0.0), 45.0)
+        max_duration = ARCHIVE_FAST_MAX_DURATION_SEC if fast_render and not quality_priority else 45.0
+        duration = min(float(clip.duration or 0.0), max_duration)
         if duration <= 0:
             raise ValueError("Uploaded video duration is invalid.")
 
         source_fps = int(clip.fps) if clip.fps else 30
-        fps_cap = 30
+        fps_cap = 24 if fast_render and not quality_priority else 30
         if duration >= 30.0 and (not bool(style.get("quality_priority", False))):
             fps_cap = 24
         target_fps = max(24, min(source_fps, fps_cap))
@@ -7259,11 +7349,11 @@ def render_video_with_moviepy(
         if cut_points[-1] < duration:
             cut_points.append(duration)
         min_seg = 0.16 if intensity >= 3 else 0.2
-        max_segments = 54 if intensity >= 3 else 40
+        max_segments = 42 if intensity >= 3 else 32
         if selective_beats and (not all_beats):
             max_segments = max(24, max_segments - 10)
         if fast_render:
-            max_segments = max(20, max_segments - 8)
+            max_segments = max(16, max_segments - 12)
         if quality_priority and (not fast_render):
             max_segments = min(64, max_segments + 6)
         cut_points = _compress_cut_points(cut_points, min_gap=min_seg, max_points=max_segments)
@@ -7853,6 +7943,7 @@ def plan() -> Any:
     mood = infer_mood(prompt)
     style_profile = build_style_profile(prompt, mood)
     style_profile = _enforce_high_energy_style(prompt, mood, style_profile)
+    style_profile = _apply_performance_defaults(prompt, style_profile)
     query = f"{MOOD_TO_QUERY.get(mood, 'phonk')} anime edit"
     deny_music = bool(style_profile.get("no_music", False))
     deny_phonk = bool(style_profile.get("no_phonk", False))
@@ -7943,6 +8034,8 @@ def render() -> Any:
 
     mood = infer_mood(prompt)
     style_profile = build_style_profile(prompt, mood)
+    style_profile = _enforce_high_energy_style(prompt, mood, style_profile)
+    style_profile = _apply_performance_defaults(prompt, style_profile)
     deny_music = bool(style_profile.get("no_music", False))
     deny_phonk = bool(style_profile.get("no_phonk", False))
     req_music_mood, req_music_strict = _infer_prompt_music_mood(prompt, mood)

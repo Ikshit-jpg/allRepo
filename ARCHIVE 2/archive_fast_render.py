@@ -89,8 +89,7 @@ def _probe(path: str | Path) -> dict[str, Any]:
 
 
 def is_fast_render_compatible(style: dict[str, Any] | None, has_music: bool) -> bool:
-    if not has_music:
-        return False
+    del has_music
     profile = style or {}
     return not any(bool(profile.get(key, False)) for key in UNSUPPORTED_STYLE_KEYS)
 
