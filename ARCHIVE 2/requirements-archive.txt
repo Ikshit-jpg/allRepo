@@ -1,7 +1,6 @@
 flask
 flask-cors
 librosa
-moviepy
 opencv-python
 numpy
 scipy

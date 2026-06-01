@@ -1,3 +1,52 @@
-﻿.venv
+﻿# Python / env
 .venv/
+venv/
+env/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime / generated
 runtime/
+**/runtime/
+**/archive_runtime/
+**/uploads/
+**/outputs/
+**/renders/
+**/brain_tmp/
+*.log
+*.tmp
+
+# Media / large assets
+**/phonks/
+**/music/
+**/musics/
+**/songs/
+**/audio/
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+
+# JS / builds / caches
+node_modules/
+**/node_modules/
+build/
+dist/
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# Local config / secrets
+.env
+.env.*
+.vscode/

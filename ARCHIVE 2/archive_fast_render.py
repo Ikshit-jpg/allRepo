@@ -14,6 +14,8 @@ from typing import Any
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
 CORES = max(2, min(16, os.cpu_count() or 4))
+FINAL_STAGE_MIN_TIMEOUT = 90
+FINAL_STAGE_MAX_TIMEOUT = 420
 
 UNSUPPORTED_STYLE_KEYS = {
     "overlap_transitions",
@@ -38,7 +40,20 @@ def _log(msg: str) -> None:
     print(f"[FAST] {msg}", flush=True)
 
 
-def _run(cmd: list[str], timeout: int = 900) -> tuple[bool, str]:
+def _cmd_preview(cmd: list[str], limit: int = 800) -> str:
+    try:
+        text = subprocess.list2cmdline([str(part) for part in cmd])
+    except Exception:
+        text = " ".join(str(part) for part in cmd)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
+def _run(cmd: list[str], timeout: int = 900, label: str = "ffmpeg") -> tuple[bool, str]:
+    started = time.time()
+    _log(f"{label} started (timeout={timeout}s)")
+    _log(f"{label} cmd: {_cmd_preview(cmd)}")
     try:
         proc = subprocess.run(
             cmd,
@@ -48,11 +63,27 @@ def _run(cmd: list[str], timeout: int = 900) -> tuple[bool, str]:
             check=False,
         )
         err = (proc.stderr or "").strip()
-        return proc.returncode == 0, err[-500:]
+        elapsed = time.time() - started
+        if proc.returncode == 0:
+            _log(f"{label} finished in {elapsed:.1f}s")
+            return True, err[-1000:]
+        message = err[-1000:] or f"exit code {proc.returncode}"
+        _log(f"{label} failed in {elapsed:.1f}s: {message[:500]}")
+        return False, message
     except subprocess.TimeoutExpired:
-        return False, "timeout"
+        message = f"timeout after {timeout}s"
+        _log(f"{label} {message}")
+        return False, message
     except Exception as exc:
-        return False, str(exc)
+        message = str(exc)
+        _log(f"{label} failed to start: {message}")
+        return False, message
+
+
+def _final_stage_timeout(info: dict[str, Any]) -> int:
+    duration = float(info.get("dur") or 0.0)
+    scaled = int(max(FINAL_STAGE_MIN_TIMEOUT, duration * 6.0))
+    return min(FINAL_STAGE_MAX_TIMEOUT, scaled)
 
 
 def _probe(path: str | Path) -> dict[str, Any]:
@@ -210,6 +241,38 @@ def build_ffmpeg_effect_chain(style: dict[str, Any], mood: str, intensity: int, 
     return ",".join(filters)
 
 
+def build_fast_visible_effect_chain(style: dict[str, Any], mood: str, intensity: int, info: dict[str, Any]) -> str:
+    """Cheap visible fallback effects for when the full look is too slow."""
+    filters: list[str] = []
+    no_color = bool(style.get("no_color_grade", False))
+    bw = bool(style.get("black_white", False))
+
+    if bw:
+        filters.extend(["hue=s=0", "eq=contrast=1.24:brightness=-0.015"])
+    elif not no_color:
+        grade = _mood_grade(mood, intensity)
+        filters.append(
+            f"eq=contrast={max(1.12, grade['contrast']):.3f}:"
+            f"saturation={max(1.18, grade['sat']):.3f}:"
+            f"brightness={grade['bright']:.4f}:gamma={grade['gamma']:.3f}"
+        )
+
+    if bool(style.get("vignette", True)) and not no_color:
+        filters.append("vignette=PI/6")
+
+    if bool(style.get("glow", False) or style.get("edge_glow", False)):
+        filters.append("unsharp=5:5:0.65:3:3:0.25")
+
+    if bool(style.get("chroma_pulse", False) or style.get("glitch", False)):
+        px = int(max(2, min(5, 1 + intensity * 2)))
+        filters.append(f"rgbashift=rh={px}:bh=-{px}")
+
+    if bool(style.get("vhs", False)):
+        filters.extend(["eq=contrast=1.06:saturation=0.92", "drawgrid=width=0:height=4:thickness=1:color=black@0.12"])
+
+    return ",".join(filters)
+
+
 def _build_cut_points(
     beats: list[float],
     duration: float,
@@ -324,7 +387,7 @@ def fast_cut_segments(
                 str(segment_path),
             ]
 
-        ok, err = _run(cmd, timeout=1200)
+        ok, err = _run(cmd, timeout=1200, label=f"segment {idx:04d}")
         if ok and segment_path.exists() and segment_path.stat().st_size > 0:
             segments.append(segment_path)
         else:
@@ -379,7 +442,7 @@ def inject_flash_frames(
         "yuv420p",
         str(flash_path),
     ]
-    ok, _ = _run(cmd, timeout=300)
+    ok, _ = _run(cmd, timeout=300, label="flash frame")
     if not ok or not flash_path.exists():
         return segment_paths
 
@@ -454,13 +517,61 @@ def concat_with_effects(
         str(output),
     ]
 
-    ok, err = _run(cmd, timeout=1800)
+    timeout = _final_stage_timeout(info)
+    ok, err = _run(cmd, timeout=timeout, label="concat/effects")
+    if not ok and effect_chain:
+        try:
+            output.unlink(missing_ok=True)
+        except Exception:
+            pass
+        fast_effect_chain = build_fast_visible_effect_chain(style, mood, intensity, info)
+        _log(f"concat/effects failed, retrying with fast visible effects: {err[:500]}")
+        retry_cmd: list[str] = [
+            FFMPEG,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list),
+        ]
+        if has_music:
+            retry_cmd += ["-ss", f"{music_start:.4f}", "-i", str(music_path)]
+        if fast_effect_chain:
+            retry_cmd += ["-vf", fast_effect_chain]
+        retry_cmd += ["-map", "0:v:0"]
+        if has_music:
+            retry_cmd += ["-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+        retry_cmd += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            str(max(crf, 20)),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-threads",
+            str(CORES),
+            str(output),
+        ]
+        ok, err = _run(retry_cmd, timeout=max(90, timeout), label="concat/fast-effects")
     try:
         concat_list.unlink(missing_ok=True)
     except Exception:
         pass
     if not ok:
-        _log(f"concat/effects failed: {err[:200]}")
+        try:
+            output.unlink(missing_ok=True)
+        except Exception:
+            pass
+        _log(f"concat/effects failed: {err[:500]}")
     return ok and output.exists() and output.stat().st_size > 0
 
 
@@ -492,7 +603,7 @@ def _minimal_fallback(
     else:
         cmd += ["-c:v", "copy"]
     cmd.append(str(output_path))
-    ok, _ = _run(cmd, timeout=300)
+    ok, _ = _run(cmd, timeout=300, label="minimal fallback")
     return ok and output_path.exists()
 
 
@@ -601,5 +712,5 @@ def post_process_with_ffmpeg(
         str(CORES),
         str(output_path),
     ]
-    ok, _ = _run(cmd, timeout=1800)
+    ok, _ = _run(cmd, timeout=_final_stage_timeout(info), label="post-process")
     return ok and output_path.exists() and output_path.stat().st_size > 0

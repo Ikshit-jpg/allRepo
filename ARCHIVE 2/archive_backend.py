@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import io
@@ -41,7 +41,6 @@ except ImportError:
 
 import librosa
 import numpy as np
-from moviepy.editor import AudioFileClip, ColorClip, VideoClip, VideoFileClip, concatenate_videoclips, vfx
 from cache import file_cache_signature, load_json_cache, prune_files, write_json_cache
 from audio_features import analyze_audio_features
 from editor_personality import apply_personality_to_style, infer_editor_personality
@@ -51,6 +50,14 @@ from scene_analysis import scene_analysis_config
 from smart_cutting import annotate_cut_scores
 from transitions import transition_name_for_mood
 from visual_understanding import enrich_segment_rows, transition_hint_from_row
+try:
+    from archive_pyav_renderer import render_video_with_pyav
+
+    PYAV_RENDERER_AVAILABLE = True
+except Exception:
+    render_video_with_pyav = None
+    PYAV_RENDERER_AVAILABLE = False
+
 try:
     from archive_engine import FFmpegEngine as PermanentFFmpegEngine
 
@@ -179,17 +186,6 @@ except Exception:
     ort = None
     ONNXRUNTIME_AVAILABLE = False
 
-try:
-    from moviepy.audio.fx.all import audio_loop as _moviepy_audio_loop_fx  # moviepy 1.x
-except Exception:
-    try:
-        from moviepy.audio.fx.AudioLoop import AudioLoop  # moviepy 2.x  # type: ignore
-
-        def _moviepy_audio_loop_fx(clip: Any, duration: float) -> Any:
-            return clip.with_effects([AudioLoop(duration=duration)])
-    except Exception:
-        _moviepy_audio_loop_fx = None
-
 sys.dont_write_bytecode = True
 
 # =============================================================================
@@ -279,7 +275,7 @@ def _setup_logging() -> None:
     if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in root_logger.handlers):
         root_logger.setLevel(logging.DEBUG if API_DEBUG else logging.INFO)
         formatter = logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE_FMT)
-        # File handler — rotates at 10 MB, keeps 3 backups.
+        # File handler â€” rotates at 10 MB, keeps 3 backups.
         try:
             file_handler = logging.handlers.RotatingFileHandler(
                 str(log_file), maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
@@ -295,7 +291,7 @@ def _setup_logging() -> None:
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
     # Quiet noisy libraries.
-    for lib in ("werkzeug", "moviepy", "imageio", "urllib3", "numba"):
+    for lib in ("werkzeug", "imageio", "urllib3", "numba"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
 _setup_logging()
@@ -314,7 +310,7 @@ if LIMITER_AVAILABLE and Limiter is not None:
     )
 else:
     limiter = None  # type: ignore[assignment]
-    logger.warning("flask-limiter not installed — rate limiting is DISABLED.")
+    logger.warning("flask-limiter not installed â€” rate limiting is DISABLED.")
 
 
 def _rate_limit(limit_string: str):
@@ -410,7 +406,7 @@ def _collect_startup_diagnostics() -> dict[str, Any]:
             "werkzeug": True,
             "numpy": True,
             "opencv": True,
-            "moviepy": True,
+            "pyav_renderer": PYAV_RENDERER_AVAILABLE,
             "librosa": True,
             "music_upgrade": MUSIC_UPGRADE_AVAILABLE,
             "effects_engine": EFFECTS_ENGINE_AVAILABLE,
@@ -513,24 +509,7 @@ ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 
 
 def _audio_loop_clip(clip: Any, duration: float) -> Any:
-    target = float(max(0.0, duration or 0.0))
-    if clip is None or target <= 0:
-        return clip
-    if _moviepy_audio_loop_fx is not None:
-        return _moviepy_audio_loop_fx(clip, duration=target)
-    base_dur = float(getattr(clip, "duration", 0.0) or 0.0)
-    if base_dur <= 0:
-        return clip
-    loops = max(1, int(math.ceil(target / base_dur)))
-    try:
-        from moviepy.editor import concatenate_audioclips
-
-        out = concatenate_audioclips([clip] * loops)
-        if float(getattr(out, "duration", 0.0) or 0.0) > target:
-            out = out.subclip(0, target)
-        return out
-    except Exception:
-        return clip
+    return clip
 
 MOOD_TO_QUERY = {
     "hype": "aggressive phonk drift",
@@ -4100,6 +4079,78 @@ def generate_beat_markers(video_duration_sec: float, bpm: int) -> list[float]:
     return [round(i * beat_interval, 3) for i in range(total_beats + 1)]
 
 
+def probe_video_metadata(video_path: Path) -> dict[str, Any]:
+    ffprobe_cmd = shutil.which("ffprobe")
+    if ffprobe_cmd:
+        try:
+            proc = run_subprocess(
+                [
+                    ffprobe_cmd,
+                    "-v",
+                    "error",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-show_format",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if proc.ok:
+                data = json.loads(proc.stdout or "{}")
+                streams = data.get("streams", [])
+                video_stream = next((s for s in streams if s.get("codec_type") == "video"), {})
+                fps_raw = str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "30/1")
+                try:
+                    num, den = fps_raw.split("/", 1)
+                    fps = float(num) / max(1.0, float(den))
+                except Exception:
+                    fps = 30.0
+                duration = float(data.get("format", {}).get("duration") or video_stream.get("duration") or 0.0)
+                return {
+                    "duration": max(0.0, duration),
+                    "fps": max(1.0, fps),
+                    "width": int(video_stream.get("width") or 0),
+                    "height": int(video_stream.get("height") or 0),
+                    "has_audio": any(s.get("codec_type") == "audio" for s in streams),
+                }
+        except Exception:
+            pass
+    return {"duration": 0.0, "fps": 30.0, "width": 0, "height": 0, "has_audio": False}
+
+
+def extract_audio_for_analysis(video_path: Path, output_path: Path, duration_sec: float) -> bool:
+    ffmpeg_cmd = shutil.which("ffmpeg")
+    if not ffmpeg_cmd:
+        return False
+    cmd = [
+        ffmpeg_cmd,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{max(0.1, float(duration_sec or BEAT_ANALYSIS_MAX_SEC)):.3f}",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "22050",
+        "-c:a",
+        "pcm_s16le",
+        str(output_path),
+    ]
+    try:
+        proc = run_subprocess(cmd, capture_output=True, text=True, timeout=90)
+        return proc.ok and output_path.exists() and output_path.stat().st_size > 0
+    except Exception:
+        return False
+
+
 def is_allowed_video(filename: str) -> bool:
     ext = Path(filename).suffix.lower()
     return ext in ALLOWED_VIDEO_EXTENSIONS
@@ -4108,27 +4159,22 @@ def is_allowed_video(filename: str) -> bool:
 def detect_beats_with_librosa(video_path: Path, mood: str) -> tuple[int, float, list[float], list[str]]:
     warnings: list[str] = []
     fallback_bpm = MOOD_TO_BPM.get(mood, 130)
+    meta = probe_video_metadata(video_path)
+    duration = float(meta.get("duration") or 0.0)
+    if not bool(meta.get("has_audio", False)):
+        warnings.append("Video has no audio; using fallback BPM.")
+        return fallback_bpm, duration, generate_beat_markers(duration, fallback_bpm), warnings
 
-    with VideoFileClip(str(video_path)) as clip:
-        duration = float(clip.duration or 0.0)
-        if not clip.audio:
-            warnings.append("Video has no audio; using fallback BPM.")
-            return fallback_bpm, duration, generate_beat_markers(duration, fallback_bpm), warnings
-
-        analysis_window = min(duration if duration > 0 else 0.0, BEAT_ANALYSIS_MAX_SEC)
-        if duration > BEAT_ANALYSIS_MAX_SEC:
-            warnings.append(
-                f"Fast beat mode enabled: analyzing first {int(BEAT_ANALYSIS_MAX_SEC)}s then extending BPM across timeline."
-            )
-
-        temp_audio_path = UPLOAD_DIR / f"audio_{uuid.uuid4().hex}.wav"
-        clip.audio.write_audiofile(
-            str(temp_audio_path),
-            fps=22050,
-            nbytes=2,
-            codec="pcm_s16le",
-            logger="bar",
+    analysis_window = min(duration if duration > 0 else 0.0, BEAT_ANALYSIS_MAX_SEC)
+    if duration > BEAT_ANALYSIS_MAX_SEC:
+        warnings.append(
+            f"Fast beat mode enabled: analyzing first {int(BEAT_ANALYSIS_MAX_SEC)}s then extending BPM across timeline."
         )
+
+    temp_audio_path = UPLOAD_DIR / f"audio_{uuid.uuid4().hex}.wav"
+    if not extract_audio_for_analysis(video_path, temp_audio_path, analysis_window):
+        warnings.append("Audio extraction failed; using fallback BPM.")
+        return fallback_bpm, duration, generate_beat_markers(duration, fallback_bpm), warnings
 
     try:
         y, sr = _fast_audio_load(temp_audio_path, duration_sec=analysis_window if analysis_window > 0 else 0.0)
@@ -5901,149 +5947,8 @@ def _apply_color_grade(
 
 
 def _make_transition_clip(size: tuple[int, int], fps: int, mood: str, index: int, style: dict[str, Any]) -> Any:
-    intensity = int(style.get("intensity", 1))
-    transition_hint = str(style.get("transition_hint", "cut"))
-    wants_flash = bool(style.get("flash", False))
-    wants_glitch = bool(style.get("glitch", False))
-    wants_overlap = bool(style.get("overlap_transitions", False))
-    wants_mask_transition = bool(style.get("mask_transition", False))
-    wants_pro_pack = bool(style.get("pro_edit_pack", False))
-
-    if mood == "hype":
-        palette = [(255, 255, 255), (165, 235, 255), (255, 220, 170)]
-        color = palette[index % len(palette)]
-        duration = 0.028 + (0.006 * intensity)
-        opacity = 0.78 + (0.05 * intensity)
-    elif mood == "dark":
-        palette = [(25, 0, 45), (12, 12, 12), (80, 10, 40)]
-        color = palette[index % len(palette)]
-        duration = 0.03 + (0.008 * intensity)
-        opacity = 0.58 + (0.06 * intensity)
-    elif mood == "dramatic":
-        palette = [(250, 250, 250), (0, 0, 0), (255, 246, 220)]
-        color = palette[index % len(palette)]
-        duration = 0.04 + (0.008 * intensity)
-        opacity = 0.52 + (0.05 * intensity)
-    elif mood == "sad":
-        color = (240, 240, 255)
-        duration = 0.04 + (0.006 * intensity)
-        opacity = 0.24 + (0.04 * intensity)
-    else:
-        if not wants_flash:
-            return None
-        color = (255, 255, 255)
-        duration = 0.022 + (0.005 * intensity)
-        opacity = 0.2 + (0.04 * intensity)
-
-    if transition_hint == "flash":
-        color = (255, 255, 255)
-        opacity = min(0.94, opacity + 0.12)
-        duration = min(0.075, duration + 0.008)
-    elif transition_hint == "glitch":
-        wants_glitch = True
-        opacity = min(0.9, opacity + 0.08)
-    elif transition_hint.startswith("wipe_"):
-        wants_mask_transition = True
-        wants_overlap = True
-        opacity = min(0.8, opacity + 0.04)
-    elif transition_hint == "soft_push":
-        wants_overlap = True
-        duration = min(0.11, duration + 0.02)
-        opacity = min(0.62, opacity)
-
-    if wants_glitch and index % 2 == 1:
-        color = (color[2], color[0], color[1])
-
-    if wants_overlap:
-        duration = min(0.095, duration + (0.012 + (0.004 * max(0, intensity - 1))))
-        opacity = min(0.92, opacity + 0.04)
-
-    if wants_mask_transition:
-        try:
-            w, h = int(size[0]), int(size[1])
-            color_rgb = np.array([color[0], color[1], color[2]], dtype=np.float32)
-            band = max(48, int(0.14 * w))
-            edge_band = max(7, int(0.03 * w))
-            inv = -1 if index % 2 else 1
-            variant_count = 3 if wants_pro_pack or transition_hint.startswith("wipe_") else 1
-            variant = (index + intensity + (1 if mood == "dark" else 0)) % variant_count
-            if transition_hint == "wipe_left" or transition_hint == "wipe_right":
-                variant = 0
-
-            def _make_frame(t: float) -> np.ndarray:
-                p = float(np.clip(t / max(0.001, duration), 0.0, 1.0))
-                x = np.arange(w, dtype=np.float32)[None, :]
-                y = np.arange(h, dtype=np.float32)[:, None]
-                if variant == 1:
-                    cx = (0.5 + (0.12 * math.sin(p * math.pi * 2.0))) * w
-                    cy = (0.5 + (0.1 * math.cos(p * math.pi * 1.6))) * h
-                    dx = x - cx
-                    dy = y - cy
-                    dist = np.sqrt((dx * dx) + (dy * dy))
-                    max_r = math.sqrt((w * w) + (h * h)) * 0.6
-                    radius = max(1.0, max_r * p)
-                    fill = np.clip(1.0 - (dist / radius), 0.0, 1.0).astype(np.float32)
-                    edge = np.clip(1.0 - (np.abs(dist - radius) / float(edge_band * 1.4)), 0.0, 1.0).astype(np.float32)
-                elif variant == 2:
-                    center = int(((p * (h + (2 * band))) - band))
-                    if inv < 0:
-                        center = h - center
-                    wave = 0.08 * h * np.sin((x / max(1.0, w)) * math.pi * 2.0 + (p * 6.0))
-                    dist = np.abs((y + wave) - center)
-                    fill = np.clip(1.0 - (dist / float(band)), 0.0, 1.0).astype(np.float32)
-                    edge = np.clip(1.0 - (dist / float(edge_band)), 0.0, 1.0).astype(np.float32)
-                else:
-                    center = int(((p * (w + (2 * band))) - band))
-                    if transition_hint == "wipe_left":
-                        center = w - center
-                    elif transition_hint == "wipe_right":
-                        center = center
-                    elif inv < 0:
-                        center = w - center
-                    diag = x + (0.34 * y)
-                    dist = np.abs(diag - center)
-                    fill = np.clip(1.0 - (dist / float(band)), 0.0, 1.0).astype(np.float32)
-                    edge = np.clip(1.0 - (dist / float(edge_band)), 0.0, 1.0).astype(np.float32)
-                fill = cv2.GaussianBlur(fill, (0, 0), sigmaX=2.2, sigmaY=2.2)
-                edge = cv2.GaussianBlur(edge, (0, 0), sigmaX=1.2, sigmaY=1.2)
-
-                frame_f = np.zeros((h, w, 3), dtype=np.float32)
-                frame_f += fill[..., None] * (color_rgb[None, None, :] * 0.25)
-                edge_color = np.array([245.0, 242.0, 255.0], dtype=np.float32)
-                if mood == "dark":
-                    edge_color = np.array([170.0, 130.0, 245.0], dtype=np.float32)
-                frame_f += edge[..., None] * edge_color[None, None, :] * 0.92
-                # Slight accent streak gives a more "AE masking" feel.
-                diag_for_streak = x + (0.34 * y)
-                streak = np.clip(1.0 - (np.abs(diag_for_streak - (center + (edge_band * 1.6))) / float(edge_band * 2.1)), 0.0, 1.0)
-                frame_f[:, :, 1] += streak * 20.0
-                frame_f[:, :, 2] += streak * 30.0
-                frame = np.clip(frame_f, 0, 255).astype(np.uint8)
-                return frame
-
-            clip_obj = (
-                VideoClip(make_frame=_make_frame, duration=duration)
-                .set_fps(fps)
-                .set_opacity(min(0.62, (0.24 + (0.07 * intensity) + (0.06 if wants_overlap else 0.0))))
-            )
-            clip_obj.size = size
-            return clip_obj
-        except Exception:
-            # Safety fallback for environments where dynamic transition clips fail.
-            return (
-                ColorClip(size=size, color=color)
-                .set_duration(duration)
-                .set_fps(fps)
-                .set_opacity(opacity)
-            )
-
-    return (
-        ColorClip(size=size, color=color)
-        .set_duration(duration)
-        .set_fps(fps)
-        .set_opacity(opacity)
-    )
-
+    # Legacy legacy renderer transition hook. The active FFmpeg/PyAV renderers build transitions elsewhere.
+    return None
 
 def _apply_mood_effects(
     segment: Any,
@@ -6822,11 +6727,11 @@ def _pick_tail_repeat_span(
 
 
 # =============================================================================
-# STRONG EFFECTS FIX — Visible Parameters
+# STRONG EFFECTS FIX â€” Visible Parameters
 # =============================================================================
 
 def _strong_glow(frame: np.ndarray, strength: float = 0.9) -> np.ndarray:
-    """Visible bloom glow. Old was 0.08 — invisible. New is 0.5-1.5."""
+    """Visible bloom glow. Old was 0.08 â€” invisible. New is 0.5-1.5."""
     f32 = frame.astype(np.float32) / 255.0
     h, w = f32.shape[:2]
     luma = 0.299*f32[:,:,2] + 0.587*f32[:,:,1] + 0.114*f32[:,:,0]
@@ -6842,7 +6747,7 @@ def _strong_glow(frame: np.ndarray, strength: float = 0.9) -> np.ndarray:
 
 
 def _strong_shake(frame: np.ndarray, t: float, amount: int = 14, freq: float = 12.0) -> np.ndarray:
-    """Visible shake. Old was 2-5px — invisible. New is 10-18px."""
+    """Visible shake. Old was 2-5px â€” invisible. New is 10-18px."""
     dx = int(amount * math.sin(2 * math.pi * freq * t))
     dy = int(amount * 0.7 * math.cos(2 * math.pi * (freq * 0.8) * t + 0.4))
     return np.roll(np.roll(frame, dy, axis=0), dx, axis=1)
@@ -7048,10 +6953,7 @@ def apply_strong_effects_to_segment(
     effect_hints: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Drop-in replacement for _apply_mood_effects() with VISIBLE parameters."""
-    try:
-        from moviepy.editor import vfx as _vfx
-    except ImportError:
-        return segment, {}
+    return segment, {}
 
     intel     = intelligence or {}
     hints     = effect_hints or {}
@@ -7222,7 +7124,7 @@ def apply_strong_effects_to_segment(
     return segment, applied
 
 
-def render_video_with_moviepy(
+def render_video_with_pyav_pipeline(
     video_path: Path,
     output_path: Path,
     beat_markers: list[float],
@@ -7238,34 +7140,21 @@ def render_video_with_moviepy(
     style = _enforce_high_energy_style(prompt_text, mood, style)
     style = _apply_performance_defaults(prompt_text, style)
     intensity = int(style.get("intensity", 1))
-    if bool(style.get("pro_edit_pack", False)) and (not bool(style.get("simple_mode", False))):
-        if not bool(style.get("overlap_transitions", False)):
-            style["overlap_transitions"] = True
-        if not bool(style.get("mask_transition", False)) and (intensity >= 2 or mood in {"hype", "dramatic"}):
-            style["mask_transition"] = True
-    wants_mask_transition = bool(style.get("mask_transition", False))
-    wants_overlap_transitions = bool(style.get("overlap_transitions", False)) or wants_mask_transition
-    selective_beats = bool(style.get("selective_beats", True)) and (not bool(style.get("all_beats", False)))
-    all_beats = bool(style.get("all_beats", False))
-    fast_render = bool(style.get("fast_render", False))
     disable_fast_renderer = bool(style.get("disable_fast_renderer", False))
-    prefer_fast_renderer = not disable_fast_renderer
-    quality_priority = bool(style.get("quality_priority", False))
     ffmpeg_available = shutil.which("ffmpeg") is not None
-    offload_to_ffmpeg = ffmpeg_available and any(bool(style.get(k, False)) for k in FFMPEG_OFFLOAD_EFFECT_KEYS)
-    ffmpeg_post_filter = _build_ffmpeg_post_filter(style, mood, int(style.get("intensity", 1))) if offload_to_ffmpeg else ""
-    if not ffmpeg_post_filter:
-        offload_to_ffmpeg = False
+    style_compatible = archive_fast_render_is_compatible(style, bool(music_path)) if archive_fast_render_is_compatible else False
     can_try_archive_fast = bool(
         FAST_RENDERER_AVAILABLE
         and run_archive_fast_render
         and archive_fast_render_is_compatible
         and ffmpeg_available
-        and prefer_fast_renderer
-        and archive_fast_render_is_compatible(style, bool(music_path))
+        and not disable_fast_renderer
+        and style_compatible
     )
+
     if can_try_archive_fast:
         try:
+            app.logger.info("[ARCHIVE] Attempting FFmpeg fast renderer for %s", output_path.name)
             fast_duration = float(
                 run_archive_fast_render(
                     video_path=video_path,
@@ -7284,477 +7173,34 @@ def render_video_with_moviepy(
             if fast_duration > 0 and output_path.exists() and output_path.stat().st_size > 0:
                 app.logger.info("[ARCHIVE] Fast FFmpeg renderer succeeded for %s", output_path.name)
                 return fast_duration
+            app.logger.warning("[ARCHIVE] FFmpeg renderer returned invalid output; switching to PyAV")
         except Exception as fast_exc:
-            app.logger.warning("Fast FFmpeg renderer failed, falling back to MoviePy: %s", fast_exc)
+            app.logger.warning("Fast FFmpeg renderer failed; switching to PyAV: %s", fast_exc, exc_info=True)
+    else:
+        app.logger.info("[ARCHIVE] FFmpeg fast renderer unavailable or incompatible; using PyAV")
 
-    with VideoFileClip(str(video_path)) as clip:
-        max_duration = ARCHIVE_FAST_MAX_DURATION_SEC if fast_render and not quality_priority else 45.0
-        duration = min(float(clip.duration or 0.0), max_duration)
-        if duration <= 0:
-            raise ValueError("Uploaded video duration is invalid.")
-
-        source_fps = int(clip.fps) if clip.fps else 30
-        fps_cap = 24 if fast_render and not quality_priority else 30
-        if duration >= 30.0 and (not bool(style.get("quality_priority", False))):
-            fps_cap = 24
-        target_fps = max(24, min(source_fps, fps_cap))
-
-        source_w, source_h = int(clip.size[0]), int(clip.size[1])
-        source_pixels = source_w * source_h
-        max_pixels = _max_render_pixels(style)
-        working_clip = clip
-        if source_pixels > max_pixels:
-            scale = math.sqrt(max_pixels / float(source_pixels))
-            new_w = max(640, int((source_w * scale) // 2 * 2))
-            new_h = max(360, int((source_h * scale) // 2 * 2))
-            working_clip = clip.resize(newsize=(new_w, new_h))
-
-        cut_density = float(style.get("cut_density", 1.0))
-        beat_step = {
-            "hype": 2,
-            "dark": 2,
-            "dramatic": 2,
-            "sad": 3,
-            "chill": 3,
-        }.get(mood, 2)
-        rng = random.Random(int(variation_seed or 0))
-        beat_step = max(1, beat_step - (1 if intensity >= 2 else 0))
-        if intensity >= 3 and duration <= 20:
-            beat_step = 1
-        elif intensity >= 3:
-            beat_step = 2
-        if selective_beats and (not all_beats):
-            beat_step += 1
-        if fast_render:
-            beat_step += 1
-        if cut_density >= 1.25:
-            beat_step = max(1, beat_step - 1)
-        elif cut_density <= 0.75:
-            beat_step += 1
-        beat_phase = rng.randrange(beat_step) if beat_step > 1 else 0
-
-        cut_points = [0.0]
-        for idx, t in enumerate(beat_markers):
-            if 0 < t < duration and ((idx + beat_phase) % beat_step == 0):
-                cut_points.append(float(t))
-
-        if len(cut_points) <= 1:
-            interval = 0.8 if mood in {"hype", "dark", "dramatic"} else 1.2
-            t = interval
-            while t < duration:
-                cut_points.append(round(t, 3))
-                t += interval
-
-        cut_points = sorted(set(cut_points))
-        if cut_points[-1] < duration:
-            cut_points.append(duration)
-        min_seg = 0.16 if intensity >= 3 else 0.2
-        max_segments = 42 if intensity >= 3 else 32
-        if selective_beats and (not all_beats):
-            max_segments = max(24, max_segments - 10)
-        if fast_render:
-            max_segments = max(16, max_segments - 12)
-        if quality_priority and (not fast_render):
-            max_segments = min(64, max_segments + 6)
-        cut_points = _compress_cut_points(cut_points, min_gap=min_seg, max_points=max_segments)
-        segment_intelligence = analyze_segment_intelligence(video_path, cut_points, source_fps=source_fps)
-        segment_intelligence = annotate_cut_scores(
-            segment_intelligence,
-            cut_points,
-            audio_features=audio_features,
-            drop_times=drop_times,
-            mood=mood,
-            style=style,
+    if PYAV_RENDERER_AVAILABLE and render_video_with_pyav:
+        pyav_duration = float(
+            render_video_with_pyav(
+                video_path=str(video_path),
+                output_path=str(output_path),
+                beat_markers=beat_markers,
+                mood=mood,
+                music_path=str(music_path) if music_path else None,
+                prompt_text=prompt_text,
+                variation_seed=variation_seed,
+                drop_times=drop_times,
+                visual_vibe=visual_vibe,
+                audio_features=audio_features,
+            )
+            or 0.0
         )
-        segment_intelligence = _annotate_peak_beats(segment_intelligence, style)
-        global_plan = build_global_edit_plan(segment_intelligence, mood, style)
-        signature_pack = select_signature_pack(
-            mood,
-            (visual_vibe if isinstance(visual_vibe, dict) else None),
-            style,
-        )
-        if drop_times:
-            for drop_t in drop_times:
-                for idx in range(len(cut_points) - 1):
-                    if cut_points[idx] <= drop_t < cut_points[idx + 1]:
-                        for j in range(max(0, idx - 1), min(len(segment_intelligence), idx + 2)):
-                            if global_plan.get("phase"):
-                                global_plan["phase"][j] = "impact"
-                            if global_plan.get("heavy_allow"):
-                                global_plan["heavy_allow"][j] = True
-                            if global_plan.get("transition_after") and j == idx:
-                                global_plan["transition_after"][j] = True
-                        break
-        effect_hints = predict_effect_hints_for_segments(segment_intelligence, mood, style)
-        for idx, row in enumerate(effect_hints):
-            if idx < len(segment_intelligence):
-                row["global_phase"] = global_plan.get("phase", [])[idx] if global_plan.get("phase") else "flow"
-                row["global_allow_heavy"] = bool(global_plan.get("heavy_allow", [True])[idx] if global_plan.get("heavy_allow") else True)
-                row["global_energy_rank"] = float(global_plan.get("energy_rank", [0.5])[idx] if global_plan.get("energy_rank") else 0.5)
-                row["global_transition_after"] = bool(global_plan.get("transition_after", [False])[idx] if global_plan.get("transition_after") else False)
-                transition_hints = global_plan.get("transition_hint", [])
-                row["global_transition_hint"] = str(transition_hints[idx] if idx < len(transition_hints) else "cut")
-                row["signature_pack"] = signature_pack
+        if pyav_duration > 0 and output_path.exists() and output_path.stat().st_size > 0:
+            app.logger.info("[ARCHIVE] PyAV renderer succeeded for %s", output_path.name)
+            return pyav_duration
+        app.logger.warning("[ARCHIVE] PyAV renderer returned invalid output; using FFmpeg safe fallback")
 
-        total_segments = max(0, len(cut_points) - 1)
-        renderable_indices = [
-            i
-            for i in range(total_segments)
-            if (cut_points[i + 1] - cut_points[i]) >= min_seg
-        ]
-
-        wants_loop_clips = bool(style.get("loop_clips", False))
-        wants_loop_ending = bool(style.get("loop_ending", False))
-        loop_count = int(np.clip(int(style.get("loop_count", 2)), 2, 4))
-        repeat_source_indices: list[int] = []
-        if wants_loop_clips and len(renderable_indices) >= 2:
-            max_repeat_len = 4 if (not fast_render) else 3
-            repeat_candidate = _pick_repeat_segment_span(
-                [segment_intelligence[i] for i in renderable_indices if i < len(segment_intelligence)],
-                min_len=2,
-                max_len=max_repeat_len,
-            )
-            if repeat_candidate is not None:
-                span_start, span_end, _span_score = repeat_candidate
-                repeat_source_indices = renderable_indices[span_start:span_end]
-
-        if repeat_source_indices:
-            repeat_before = renderable_indices.index(repeat_source_indices[-1]) + 1
-            segment_plan = (
-                renderable_indices[:repeat_before]
-                + (repeat_source_indices * (loop_count - 1))
-                + renderable_indices[repeat_before:]
-            )
-        else:
-            segment_plan = list(renderable_indices)
-        repeat_source_set = set(repeat_source_indices)
-        tail_repeat_indices: list[int] = []
-        if wants_loop_ending:
-            tail_repeat_indices = _pick_tail_repeat_span(
-                renderable_indices,
-                segment_intelligence,
-                min_len=2,
-                max_len=3 if intensity <= 2 else 4,
-            )
-
-        timeline: list[Any] = []
-        label_rows: list[dict[str, Any]] = []
-        segment_cache: dict[int, tuple[Any, dict[str, Any]]] = {}
-        recent_effects: deque[str] = deque(maxlen=2)
-        effect_cooldowns: dict[str, int] = {}
-        effect_cooldown_len = {
-            "fire_lines": 3,
-            "energy_aura": 3,
-            "turbulent": 2,
-            "glitch": 2,
-            "chroma_pulse": 2,
-            "speed_ramp": 2,
-            "zoom": 2,
-            "shake": 1,
-            "particles": 2,
-            "blend_overlay": 2,
-            "mask_roto": 2,
-            "chroma_key": 2,
-            "difference_matte": 2,
-            "object_inpaint": 2,
-            "posterize_time": 2,
-        }
-        transition_size = (int(working_clip.size[0]), int(working_clip.size[1]))
-        transition_every = 4 if (intensity >= 3 and duration <= 20) else 5
-        if wants_overlap_transitions:
-            transition_every = max(2, transition_every - 2)
-        if wants_mask_transition:
-            transition_every = max(2, transition_every - 1)
-        if selective_beats and (not all_beats):
-            transition_every = min(7, transition_every + 1)
-        if fast_render:
-            transition_every = min(8, transition_every + 1)
-        if quality_priority and (not fast_render):
-            transition_every = max(2, transition_every - 1)
-        transition_phase = rng.randrange(transition_every) if transition_every > 1 else 0
-        for out_idx, src_idx in enumerate(segment_plan):
-            start = cut_points[src_idx]
-            end = cut_points[src_idx + 1]
-
-            if src_idx in segment_cache:
-                cached_segment, cached_applied = segment_cache[src_idx]
-                try:
-                    segment = cached_segment.copy()
-                except Exception:
-                    segment = cached_segment
-                applied = dict(cached_applied)
-            else:
-                seg_len = float(end - start)
-                segment = working_clip.subclip(start, end)
-                fade_sec = 0.012 if intensity >= 3 else (0.02 if mood in {"hype", "dark"} else 0.04)
-                # For overlap transitions, use minimal fades (overlap does the blending)
-                # For normal cuts, use stronger fades on longer clips
-                if wants_overlap_transitions:
-                    fade_sec = 0.004  # Ultra-minimal fade with overlap
-                    segment = segment.fx(vfx.fadein, fade_sec).fx(vfx.fadeout, fade_sec)
-                elif seg_len > 0.36:
-                    fade_sec = max(fade_sec, 0.015)
-                    segment = segment.fx(vfx.fadein, fade_sec).fx(vfx.fadeout, fade_sec)
-                intel = segment_intelligence[src_idx] if src_idx < len(segment_intelligence) else None
-                hints = effect_hints[src_idx] if src_idx < len(effect_hints) else None
-                hints = dict(hints or {})
-                if recent_effects:
-                    hints["avoid_effects"] = list(recent_effects)
-                cooldown_block = [k for k, v in effect_cooldowns.items() if v > 0]
-                if cooldown_block:
-                    if "avoid_effects" in hints:
-                        hints["avoid_effects"] = list(set(hints["avoid_effects"] + cooldown_block))
-                    else:
-                        hints["avoid_effects"] = cooldown_block
-                segment, applied = apply_strong_effects_to_segment(
-                    segment,
-                    mood,
-                    src_idx,
-                    style,
-                    intel,
-                    hints,
-                )
-                segment_cache[src_idx] = (segment, dict(applied))
-
-            if repeat_source_set and (src_idx in repeat_source_set):
-                applied["clip_repeat_applied"] = True
-                applied["clip_repeat_count"] = loop_count
-            else:
-                applied["clip_repeat_applied"] = False
-                applied["clip_repeat_count"] = 1
-
-            label_rows.append(applied)
-            timeline.append(segment)
-            applied_order = [
-                "zoom",
-                "shake",
-                "glow",
-                "flash",
-                "glitch",
-                "chroma_pulse",
-                "speed_ramp",
-                "slow_motion",
-                "fast_motion",
-                "reverse",
-                "boomerang",
-                "particles",
-                "energy_aura",
-                "turbulent",
-                "posterize_time",
-                "blend_overlay",
-                "mask_roto",
-                "chroma_key",
-                "difference_matte",
-                "object_inpaint",
-                "fire_lines",
-                "black_white",
-            ]
-            # Cooldown tick
-            for k in list(effect_cooldowns.keys()):
-                effect_cooldowns[k] = max(0, effect_cooldowns[k] - 1)
-            for key in applied_order:
-                if applied.get(f"{key}_applied", False) and key not in recent_effects:
-                    recent_effects.append(key)
-                if applied.get(f"{key}_applied", False):
-                    effect_cooldowns[key] = effect_cooldown_len.get(key, 2)
-
-            transition_slot = False
-            transition_hint = "cut"
-            if src_idx < len(effect_hints):
-                transition_slot = bool(effect_hints[src_idx].get("global_transition_after", False))
-                transition_hint = str(effect_hints[src_idx].get("global_transition_hint", "cut"))
-            if out_idx < len(segment_plan) - 1 and (transition_slot or ((out_idx + transition_phase) % transition_every == 0)):
-                transition_style = dict(style)
-                transition_style["transition_hint"] = transition_hint
-                transition = _make_transition_clip(transition_size, target_fps, mood, src_idx, transition_style)
-                if transition is not None:
-                    timeline.append(transition)
-
-        if tail_repeat_indices:
-            for src_idx in tail_repeat_indices:
-                if src_idx in segment_cache:
-                    cached_segment, cached_applied = segment_cache[src_idx]
-                    try:
-                        segment = cached_segment.copy()
-                    except Exception:
-                        segment = cached_segment
-                    applied = dict(cached_applied)
-                else:
-                    start = cut_points[src_idx]
-                    end = cut_points[src_idx + 1]
-                    segment = working_clip.subclip(start, end)
-                    fade_sec = 0.012 if intensity >= 3 else (0.02 if mood in {"hype", "dark"} else 0.04)
-                    # For overlap transitions, use minimal fades (overlap does the blending)
-                    # For normal cuts, use stronger fades on longer clips
-                    if wants_overlap_transitions:
-                        fade_sec = 0.004  # Ultra-minimal fade with overlap
-                        segment = segment.fx(vfx.fadein, fade_sec).fx(vfx.fadeout, fade_sec)
-                    elif float(end - start) > 0.36:
-                        fade_sec = max(fade_sec, 0.015)
-                        segment = segment.fx(vfx.fadein, fade_sec).fx(vfx.fadeout, fade_sec)
-                    intel = segment_intelligence[src_idx] if src_idx < len(segment_intelligence) else None
-                    hints = effect_hints[src_idx] if src_idx < len(effect_hints) else None
-                    segment, applied = apply_strong_effects_to_segment(
-                        segment,
-                        mood,
-                        src_idx,
-                        style,
-                        intel,
-                        hints,
-                    )
-                applied["clip_repeat_applied"] = True
-                applied["clip_repeat_count"] = 2
-                label_rows.append(applied)
-                timeline.append(segment)
-
-        if not timeline:
-            timeline = [working_clip.subclip(0, duration)]
-
-        # Force minimum contrast on timeline before concatenation
-        contrast_boost = 12 + (intensity * 6)
-        timeline = [
-            clip.fx(vfx.lum_contrast, 0, contrast_boost, 128)
-            for clip in timeline
-        ]
-
-        if wants_overlap_transitions:
-            overlap_base = 0.035 + (0.01 * intensity)
-            overlap_jitter = (rng.random() - 0.5) * 0.012
-            overlap_sec = float(np.clip(overlap_base + overlap_jitter, 0.03, 0.085))
-            final_clip = concatenate_videoclips(timeline, method="compose", padding=-overlap_sec)
-        else:
-            final_clip = concatenate_videoclips(timeline, method="chain")
-        music_clip = None
-        if music_path and music_path.exists():
-            try:
-                music_clip = AudioFileClip(str(music_path))
-                final_duration = float(final_clip.duration or 0.0)
-                if float(music_clip.duration or 0.0) < final_duration:
-                    music_clip = _audio_loop_clip(music_clip, duration=float(final_clip.duration or 0.0))
-                else:
-                    if MUSIC_UPGRADE_AVAILABLE and select_music_excerpt_for_video_v2:
-                        music_start_sec, _music_info = select_music_excerpt_for_video_v2(
-                            music_path,
-                            target_duration_sec=final_duration,
-                            mood=mood,
-                            variation_seed=variation_seed,
-                        )
-                    else:
-                        music_start_sec, _music_info = select_music_excerpt_for_video(
-                            music_path,
-                            target_duration_sec=final_duration,
-                            mood=mood,
-                            variation_seed=variation_seed,
-                        )
-                    music_end_sec = min(float(music_clip.duration or 0.0), music_start_sec + final_duration)
-                    if music_end_sec - music_start_sec < 0.2:
-                        music_start_sec = 0.0
-                        music_end_sec = min(float(music_clip.duration or 0.0), final_duration)
-                    music_clip = music_clip.subclip(music_start_sec, music_end_sec)
-                    if float(music_clip.duration or 0.0) < final_duration:
-                        music_clip = _audio_loop_clip(music_clip, duration=final_duration)
-                final_clip = final_clip.set_audio(music_clip)
-            except Exception as music_exc:
-                try:
-                    if music_clip:
-                        music_clip.close()
-                except Exception:
-                    pass
-                music_clip = None
-                app.logger.warning(
-                    "Music track load failed (%s). Falling back to source audio.",
-                    music_exc,
-                )
-
-        cpu_threads = os.cpu_count() or 4
-        encode_threads = max(4, min(16, cpu_threads))
-        if bool(style.get("quality_priority", False)):
-            default_cpu_preset = "veryfast"
-        else:
-            if duration >= 30.0:
-                default_cpu_preset = "superfast"
-            elif duration >= 18.0:
-                default_cpu_preset = "veryfast"
-            else:
-                default_cpu_preset = "veryfast" if intensity <= 2 else "superfast"
-        preferred_codec = _pick_best_working_video_codec()
-
-        ffmpeg_params = ["-movflags", "+faststart", "-pix_fmt", "yuv420p"]
-        write_kwargs = {
-            "audio_codec": "aac",
-            "fps": target_fps,
-            "threads": encode_threads,
-            "temp_audiofile": str(UPLOAD_DIR / f"temp_audio_{uuid.uuid4().hex}.m4a"),
-            "remove_temp": True,
-            "ffmpeg_params": ffmpeg_params,
-            "logger": "bar",
-        }
-        if preferred_codec == "libx264":
-            write_kwargs["preset"] = default_cpu_preset
-            ffmpeg_params.extend(["-crf", "18"])
-        elif preferred_codec == "h264_nvenc":
-            ffmpeg_params.extend(["-preset", "p4", "-rc", "vbr", "-cq", "19"])
-
-        moviepy_output_path = output_path
-        temp_post_path: Path | None = None
-        if offload_to_ffmpeg:
-            temp_post_path = output_path.with_name(f"{output_path.stem}_mpy.mp4")
-            moviepy_output_path = temp_post_path
-
-        try:
-            final_clip.write_videofile(
-                str(moviepy_output_path),
-                codec=preferred_codec,
-                **write_kwargs,
-            )
-        except Exception:
-            # Turbo Mode: Use ultrafast to slash assembly time
-            fallback_kwargs = dict(write_kwargs)
-            fallback_kwargs["preset"] = "ultrafast"
-            fallback_kwargs["ffmpeg_params"] = ["-movflags", "+faststart", "-pix_fmt", "yuv420p", "-crf", "21"]
-            final_clip.write_videofile(
-                str(moviepy_output_path),
-                codec="libx264",
-                **fallback_kwargs,
-            )
-
-        if offload_to_ffmpeg and temp_post_path is not None and temp_post_path.exists():
-            ok_post = _run_ffmpeg_postprocess(
-                temp_post_path,
-                output_path,
-                ffmpeg_post_filter,
-                threads=encode_threads,
-            )
-            if not ok_post:
-                try:
-                    if output_path.exists():
-                        output_path.unlink(missing_ok=True)
-                    temp_post_path.replace(output_path)
-                except Exception:
-                    shutil.copy2(temp_post_path, output_path)
-            temp_post_path.unlink(missing_ok=True)
-
-        _apply_external_brain_polish(
-            output_path,
-            mood,
-            style,
-            intensity,
-            logger_obj=logger,
-            request_id=getattr(g, "request_id", ""),
-        )
-
-        out_duration = float(final_clip.duration or 0.0)
-        final_clip.close()
-        if music_clip:
-            music_clip.close()
-        append_segment_labels_csv(
-            csv_path=output_path.parent / "segment_labels.csv",
-            render_name=output_path.name,
-            mood=mood,
-            style=style,
-            rows=label_rows,
-        )
-        return out_duration
+    return render_video_safe_fallback(video_path, output_path, music_path=music_path)
 
 
 def render_video_safe_fallback(
@@ -7766,60 +7212,97 @@ def render_video_safe_fallback(
     Minimal, resilient render path used only when advanced pipeline fails.
     Keeps API responsive instead of returning HTTP 500.
     """
-    with VideoFileClip(str(video_path)) as clip:
-        duration = min(float(clip.duration or 0.0), 45.0)
-        if duration <= 0:
-            raise ValueError("Uploaded video duration is invalid.")
+    meta = probe_video_metadata(video_path)
+    duration = min(float(meta.get("duration") or 0.0), 45.0)
+    if duration <= 0:
+        raise ValueError("Uploaded video duration is invalid.")
 
-        source_fps = int(clip.fps) if clip.fps else 30
-        target_fps = max(24, min(source_fps, 30))
-        source_w, source_h = int(clip.size[0]), int(clip.size[1])
-        source_pixels = source_w * source_h
-        max_pixels = _max_render_pixels({})
+    ffmpeg_cmd = shutil.which("ffmpeg")
+    if not ffmpeg_cmd:
+        shutil.copy2(video_path, output_path)
+        return duration
 
-        base_clip = clip.subclip(0, duration)
-        if source_pixels > max_pixels:
-            scale = math.sqrt(max_pixels / float(source_pixels))
-            new_w = max(640, int((source_w * scale) // 2 * 2))
-            new_h = max(360, int((source_h * scale) // 2 * 2))
-            base_clip = base_clip.resize(newsize=(new_w, new_h))
-
-        music_clip = None
+    tmp_video = output_path.with_name(f"{output_path.stem}_safe_video.mp4")
+    cmd = [
+        ffmpeg_cmd,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *ffmpeg_hwaccel_input_args(),
+        "-i",
+        str(video_path),
+        "-t",
+        f"{duration:.3f}",
+        "-an",
+        "-vf",
+        "scale='min(1280,iw)':-2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        str(tmp_video),
+    ]
+    proc = run_subprocess(cmd, capture_output=True, text=True, timeout=max(120, int(duration * 8)))
+    if not proc.ok:
+        shutil.copy2(video_path, output_path)
+        return duration
+    try:
         if music_path and music_path.exists():
-            try:
-                music_clip = AudioFileClip(str(music_path))
-                if float(music_clip.duration or 0.0) < duration:
-                    music_clip = _audio_loop_clip(music_clip, duration=duration)
-                else:
-                    music_clip = music_clip.subclip(0, duration)
-                base_clip = base_clip.set_audio(music_clip)
-            except Exception:
-                try:
-                    if music_clip:
-                        music_clip.close()
-                except Exception:
-                    pass
-                music_clip = None
-
-        ffmpeg_params = ["-movflags", "+faststart", "-pix_fmt", "yuv420p", "-crf", "19"]
-        base_clip.write_videofile(
-            str(output_path),
-            codec="libx264",
-            audio_codec="aac",
-            preset="veryfast",
-            fps=target_fps,
-            threads=max(2, min(8, os.cpu_count() or 4)),
-            temp_audiofile=str(UPLOAD_DIR / f"temp_audio_safe_{uuid.uuid4().hex}.m4a"),
-            remove_temp=True,
-            ffmpeg_params=ffmpeg_params,
-            logger="bar",
-        )
-
-        out_duration = float(base_clip.duration or duration)
-        base_clip.close()
-        if music_clip:
-            music_clip.close()
-        return out_duration
+            mux_cmd = [
+                ffmpeg_cmd,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(tmp_video),
+                "-stream_loop",
+                "-1",
+                "-i",
+                str(music_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-t",
+                f"{duration:.3f}",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        else:
+            mux_cmd = [
+                ffmpeg_cmd,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(tmp_video),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        proc_mux = run_subprocess(mux_cmd, capture_output=True, text=True, timeout=max(120, int(duration * 8)))
+        if not proc_mux.ok:
+            shutil.copy2(tmp_video, output_path)
+        return duration
+    finally:
+        tmp_video.unlink(missing_ok=True)
 
 
 def _passthrough_video_fallback(input_path: Path, output_path: Path) -> float:
@@ -7828,11 +7311,7 @@ def _passthrough_video_fallback(input_path: Path, output_path: Path) -> float:
     Prevents user-facing 500s when local codec/environment fails.
     """
     shutil.copy2(input_path, output_path)
-    try:
-        with VideoFileClip(str(output_path)) as c:
-            return float(c.duration or 0.0)
-    except Exception:
-        return 0.0
+    return float(probe_video_metadata(output_path).get("duration") or 0.0)
 
 
 def build_edit_actions(beat_markers: list[float], mood: str) -> list[dict[str, Any]]:
@@ -8189,11 +7668,9 @@ def render() -> Any:
                         "Requested folder music (happy/romantic) was not found in local library. Using source audio only."
                     )
         t_select = time.perf_counter() - t1
-        source_duration = 0.0
-        source_fps = 30.0
-        with VideoFileClip(str(input_path)) as src_clip:
-            source_duration = float(src_clip.duration or 0.0)
-            source_fps = float(src_clip.fps or 30.0)
+        source_meta = probe_video_metadata(input_path)
+        source_duration = float(source_meta.get("duration") or 0.0)
+        source_fps = float(source_meta.get("fps") or 30.0)
 
         if deny_music or skip_music_search:
             t_proxy_rank = 0.0
@@ -8281,8 +7758,7 @@ def render() -> Any:
                         audio_analysis = None
             except Exception as beat_exc:
                 detected_bpm = int(MOOD_TO_BPM.get(mood, 130))
-                with VideoFileClip(str(input_path)) as src_clip:
-                    safe_duration = float(src_clip.duration or source_duration or 0.0)
+                safe_duration = float(source_duration or probe_video_metadata(input_path).get("duration") or 0.0)
                 beat_markers = generate_beat_markers(safe_duration, detected_bpm)
                 beat_warnings = [f"Video-audio beat fallback used ({beat_exc})."]
             warnings.append("No local music track selected; synced to video audio.")
@@ -8319,7 +7795,7 @@ def render() -> Any:
         use_brain = bool(style_profile.get("brain_render", True)) and BRAIN_RENDER_AVAILABLE
         if use_brain and not shutil.which("ffmpeg"):
             use_brain = False
-            warnings.append("Brain renderer requires FFmpeg; falling back to MoviePy pipeline.")
+            warnings.append("Brain renderer requires FFmpeg; falling back to PyAV/FFmpeg pipeline.")
         try:
             if use_brain and run_brain_render:
                 app.logger.info("[ARCHIVE] Stage 4/5: brain render pipeline")
@@ -8376,19 +7852,19 @@ def render() -> Any:
                     )
                 else:
                     reason = brain_result.get("reason") if isinstance(brain_result, dict) else "unknown"
-                    warnings.append(f"Brain renderer failed ({reason}); falling back to MoviePy pipeline.")
+                    warnings.append(f"Brain renderer failed ({reason}); falling back to PyAV/FFmpeg pipeline.")
                     try:
                         output_path.unlink(missing_ok=True)
                     except Exception:
                         pass
                     _set_render_status(
                         render_id,
-                        stage="moviepy_fallback",
+                        stage="pyav_fallback",
                         progress_pct=72.0,
-                        message="Brain render fallback triggered, switching to MoviePy pipeline...",
+                        message="Brain render fallback triggered, switching to PyAV/FFmpeg pipeline...",
                         done=False,
                     )
-                    render_duration = render_video_with_moviepy(
+                    render_duration = render_video_with_pyav_pipeline(
                         input_path,
                         output_path,
                         beat_markers,
@@ -8401,7 +7877,7 @@ def render() -> Any:
                         audio_features=audio_analysis,
                     )
             else:
-                render_duration = render_video_with_moviepy(
+                render_duration = render_video_with_pyav_pipeline(
                     input_path,
                     output_path,
                     beat_markers,
@@ -8660,3 +8136,6 @@ def phonk_file(filename: str) -> Any:
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=API_DEBUG)
+
+
+
