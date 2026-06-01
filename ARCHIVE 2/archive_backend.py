@@ -7192,6 +7192,7 @@ def render_video_with_pyav_pipeline(
                 drop_times=drop_times,
                 visual_vibe=visual_vibe,
                 audio_features=audio_features,
+                style_profile=style,
             )
             or 0.0
         )

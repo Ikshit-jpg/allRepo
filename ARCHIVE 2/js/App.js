@@ -200,14 +200,17 @@ export default function App() {
   };
 
   const buildSummary = (data) => {
+    const effectKeys = new Set([
+      "auto_timefx", "blend_overlay", "character_focus", "chroma_pulse",
+      "color_grade", "edge_glow", "energy_aura", "fire_lines", "flash",
+      "glitch", "glow", "grain", "ken_burns", "mask_roto",
+      "mask_transition", "motion_blur", "overlap_transitions", "particles",
+      "posterize_time", "shake", "speed_ramp", "turbulent_displace",
+      "vignette", "zoom",
+    ]);
     const activeEffects = data.style_profile
       ? Object.entries(data.style_profile)
-          .filter(
-            ([key, value]) =>
-              key !== "intensity" &&
-              !["selective_beats", "all_beats", "fast_render", "quality_priority", "smart_music"].includes(key) &&
-              Boolean(value)
-          )
+          .filter(([key, value]) => effectKeys.has(key) && Boolean(value))
           .map(([key]) => key)
           .join(", ")
       : "n/a";

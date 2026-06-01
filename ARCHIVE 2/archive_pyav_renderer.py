@@ -59,6 +59,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    import cv2  # type: ignore
+except Exception:
+    cv2 = None  # type: ignore[assignment]
+
 log = logging.getLogger(__name__)
 
 
@@ -270,6 +275,87 @@ def apply_vignette(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.clip(frame.astype(np.float32) * mask, 0.0, 255.0).astype(np.uint8)
 
 
+def apply_rgb_shift(frame: np.ndarray, pixels: int = 5) -> np.ndarray:
+    px = int(max(1, min(16, pixels)))
+    out = frame.copy()
+    out[:, :, 0] = np.roll(frame[:, :, 0], px, axis=1)
+    out[:, :, 2] = np.roll(frame[:, :, 2], -px, axis=1)
+    return out
+
+
+def apply_glow(frame: np.ndarray, strength: float = 0.35) -> np.ndarray:
+    if cv2 is None:
+        return frame
+    blur = cv2.GaussianBlur(frame, (0, 0), sigmaX=4.5, sigmaY=4.5)
+    return cv2.addWeighted(frame, 1.0, blur, float(np.clip(strength, 0.1, 0.75)), 0)
+
+
+def apply_grain(frame: np.ndarray, amount: float = 8.0, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(0.0, float(amount), frame.shape).astype(np.float32)
+    return np.clip(frame.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
+
+
+def apply_shake(frame: np.ndarray, t: float, amount: int = 8, freq: float = 11.0) -> np.ndarray:
+    amp = int(max(2, min(24, amount)))
+    dx = int(math.sin(t * freq * 2.0 * math.pi) * amp)
+    dy = int(math.cos(t * freq * 1.7 * math.pi) * max(1, amp // 2))
+    return np.roll(np.roll(frame, dy, axis=0), dx, axis=1)
+
+
+def apply_zoom(frame: np.ndarray, factor: float = 1.08) -> np.ndarray:
+    if cv2 is None:
+        return frame
+    h, w = frame.shape[:2]
+    z = float(np.clip(factor, 1.01, 1.22))
+    crop_w = max(2, int(w / z))
+    crop_h = max(2, int(h / z))
+    x0 = max(0, (w - crop_w) // 2)
+    y0 = max(0, (h - crop_h) // 2)
+    cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def apply_flash(frame: np.ndarray, strength: float = 0.55) -> np.ndarray:
+    alpha = float(np.clip(strength, 0.0, 0.85))
+    white = np.full_like(frame, 255)
+    return np.clip(frame.astype(np.float32) * (1.0 - alpha) + white.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
+
+
+def apply_fire_border(frame: np.ndarray, t: float, intensity: float = 0.7) -> np.ndarray:
+    h, w = frame.shape[:2]
+    border = max(2, min(18, int(min(h, w) * 0.012)))
+    pulse = 0.55 + 0.45 * math.sin(t * 18.0)
+    alpha = float(np.clip(intensity * pulse, 0.15, 0.85))
+    out = frame.astype(np.float32)
+    color = np.array([40.0, 150.0, 255.0], dtype=np.float32)
+    out[:border, :, :] = out[:border, :, :] * (1 - alpha) + color * alpha
+    out[-border:, :, :] = out[-border:, :, :] * (1 - alpha) + color * alpha
+    out[:, :border, :] = out[:, :border, :] * (1 - alpha) + color * alpha
+    out[:, -border:, :] = out[:, -border:, :] * (1 - alpha) + color * alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_particles(frame: np.ndarray, t: float, seed: int = 0, count: int = 32) -> np.ndarray:
+    out = frame.copy()
+    h, w = out.shape[:2]
+    rng = np.random.default_rng(seed + int(t * 24))
+    xs = rng.integers(0, max(1, w), size=count)
+    ys = rng.integers(0, max(1, h), size=count)
+    for x, y in zip(xs, ys):
+        out[max(0, y - 1):min(h, y + 2), max(0, x - 1):min(w, x + 2)] = [220, 235, 255]
+    return out
+
+
+def _active_style_flags(style: dict[str, Any]) -> list[str]:
+    effect_keys = [
+        "color_grade", "glow", "edge_glow", "glitch", "chroma_pulse", "grain",
+        "shake", "zoom", "flash", "fire_lines", "energy_aura", "particles",
+        "vignette", "black_white", "motion_blur", "speed_ramp",
+    ]
+    return [key for key in effect_keys if bool(style.get(key, False))]
+
+
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # SEGMENT PLANNER
 # Builds a list of source-video segments to cut and assemble.
@@ -295,8 +381,8 @@ def _plan_segments(
             'start':    0.0,
             'end':      min(video_dur, target_dur),
             'speed':    1.0,
-            'fade_in':  cfg['fade_dur'],
-            'fade_out': cfg['fade_dur'],
+            'fade_in':  0.0,
+            'fade_out': 0.0,
             'out_dur':  min(video_dur, target_dur),
         }]
 
@@ -309,7 +395,7 @@ def _plan_segments(
 
     segments   = []
     total_out  = 0.0
-    fade_dur   = cfg['fade_dur']
+    fade_dur   = 0.0
     drops_set  = set(drop_times or [])
 
     for i in range(len(boundaries) - 1):
@@ -361,8 +447,20 @@ def _plan_segments(
     if not segments:
         dur = min(video_dur, target_dur)
         segments = [{'start': 0.0, 'end': dur, 'speed': 1.0,
-                     'is_drop': False, 'fade_in': fade_dur,
-                     'fade_out': fade_dur, 'out_dur': dur}]
+                     'is_drop': False, 'fade_in': 0.0,
+                     'fade_out': 0.0, 'out_dur': dur}]
+    max_segments = 64 if target_dur >= 30.0 else 48
+    if len(segments) > max_segments:
+        step = int(math.ceil(len(segments) / max_segments))
+        kept: List[dict] = []
+        for idx in range(0, len(segments), step):
+            merged = dict(segments[idx])
+            end_idx = min(len(segments) - 1, idx + step - 1)
+            merged['end'] = segments[end_idx]['end']
+            merged['out_dur'] = max(0.05, (merged['end'] - merged['start']) / max(0.1, merged['speed']))
+            merged['is_drop'] = any(bool(seg.get('is_drop')) for seg in segments[idx:end_idx + 1])
+            kept.append(merged)
+        segments = kept[:max_segments]
     return segments
 
 
@@ -622,6 +720,7 @@ def render_video_with_pyav(
     drop_times:     Optional[List[float]] = None,
     visual_vibe:    Optional[str]        = None,
     audio_features: Optional[dict]       = None,
+    style_profile:  Optional[dict]       = None,
 ) -> float:
     """
     PyAV-based video renderer.
@@ -641,8 +740,11 @@ def render_video_with_pyav(
     t0   = time.time()
     seed = variation_seed or 42
     cfg  = MOOD_CONFIG.get(mood, _DEFAULT_CFG)
+    style = dict(style_profile or {})
+    active_flags = _active_style_flags(style)
 
     log.info(f'[PyAV] render start  mood={mood}  src={Path(video_path).name}')
+    log.info(f'[PyAV] active effects: {", ".join(active_flags) if active_flags else "mood_grade, vignette"}')
 
     # â”€â”€ 1. PROBE SOURCE VIDEO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
@@ -718,6 +820,33 @@ def render_video_with_pyav(
 
     pts_out      = 0        # output frame counter (= output PTS at 1/fps)
     total_frames = 0
+    expected_frames = max(1, int(target_dur * target_fps))
+    progress_interval_sec = 5.0
+    next_progress_at = time.time() + progress_interval_sec
+
+    def _log_render_progress(seg_index: int, *, force: bool = False) -> None:
+        nonlocal next_progress_at
+        now = time.time()
+        if not force and now < next_progress_at:
+            return
+        elapsed = max(0.001, now - t0)
+        pct = min(99.0, (total_frames / expected_frames) * 100.0)
+        out_sec = total_frames / max(1, target_fps)
+        fps_done = total_frames / elapsed
+        rt = elapsed / max(0.1, out_sec)
+        log.info(
+            "[PyAV] progress %5.1f%% | segment %d/%d | frames %d/%d | %.1fs output | %.1fs elapsed | %.1f fps | %.2fx realtime",
+            pct,
+            min(seg_index + 1, len(segments)),
+            len(segments),
+            total_frames,
+            expected_frames,
+            out_sec,
+            elapsed,
+            fps_done,
+            rt,
+        )
+        next_progress_at = now + progress_interval_sec
 
     try:
         in_c = av.open(video_path)
@@ -726,6 +855,7 @@ def render_video_with_pyav(
         # when the source FPS is lower than the target FPS.
 
         for seg_idx, seg in enumerate(segments):
+            _log_render_progress(seg_idx, force=(seg_idx == 0))
             s_start  = max(0.0, seg['start'])
             s_end    = min(seg['end'], video_dur)
             speed    = max(0.05, seg['speed'])
@@ -809,6 +939,28 @@ def render_video_with_pyav(
                     # 3. Vignette (pre-computed mask â€” near-zero cost)
                     frame_np = apply_vignette(frame_np, vign_mask)
 
+                    local_t = out_frame_idx / max(1, target_fps)
+                    global_t = pts_out / max(1, target_fps)
+                    impact = bool(seg.get('is_drop', False)) or (seg_idx % 4 == 0)
+
+                    if bool(style.get('zoom', False)) or bool(style.get('ken_burns', False)) or (impact and bool(style.get('speed_ramp', False))):
+                        frame_np = apply_zoom(frame_np, 1.04 + (0.04 * (0.5 + 0.5 * math.sin(local_t * math.pi))))
+                    if bool(style.get('shake', False)) or (impact and bool(style.get('motion_intensity', 0))):
+                        frame_np = apply_shake(frame_np, global_t, amount=6 + int(2 * int(style.get('intensity', 2))))
+                    if bool(style.get('glitch', False)) or bool(style.get('chroma_pulse', False)):
+                        px = 3 + int(2 * int(style.get('intensity', 2)))
+                        frame_np = apply_rgb_shift(frame_np, px)
+                    if bool(style.get('glow', False)) or bool(style.get('edge_glow', False)) or bool(style.get('energy_aura', False)):
+                        frame_np = apply_glow(frame_np, 0.22 + (0.08 * int(style.get('intensity', 2))))
+                    if bool(style.get('grain', False)) or bool(style.get('posterize_time', False)):
+                        frame_np = apply_grain(frame_np, 5.0 + (2.5 * int(style.get('intensity', 2))), seed + total_frames)
+                    if bool(style.get('fire_lines', False)) or bool(style.get('energy_aura', False)):
+                        frame_np = apply_fire_border(frame_np, global_t, 0.45 + (0.12 * int(style.get('intensity', 2))))
+                    if bool(style.get('particles', False)):
+                        frame_np = apply_particles(frame_np, global_t, seed + seg_idx, count=20 + 6 * int(style.get('intensity', 2)))
+                    if bool(style.get('flash', False)) and impact and local_t < 0.08:
+                        frame_np = apply_flash(frame_np, 0.65 * (1.0 - local_t / 0.08))
+
                     # â”€â”€ EMIT frames_to_emit OUTPUT FRAMES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     for _ in range(frames_to_emit):
                         if out_frame_idx >= seg_out_frames:
@@ -847,6 +999,10 @@ def render_video_with_pyav(
                         pts_out       += 1
                         out_frame_idx += 1
                         total_frames  += 1
+                        _log_render_progress(seg_idx)
+
+            if seg_idx % 10 == 0 or seg_idx == len(segments) - 1:
+                _log_render_progress(seg_idx, force=True)
 
     except Exception as render_err:
         log.error(f'[PyAV] render loop error: {render_err}')
@@ -863,49 +1019,7 @@ def render_video_with_pyav(
     except Exception:
         pass
 
-    # â”€â”€ 7. MUX AUDIO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if False:
-        try:
-            import av as _av
-            a_in   = _av.open(tmp_audio)
-            a_src  = a_in.streams.audio[0]
-            out_a  = out_c.add_stream('aac', rate=44100)
-            out_a.bit_rate = 192_000
-
-            resampler = _av.AudioResampler(format='fltp', layout='stereo', rate=44100)
-            a_pts     = 0
-            a_target  = int(target_dur * 44100)
-
-            for pkt in a_in.demux(a_src):
-                if a_pts >= a_target:
-                    break
-                try:
-                    for frm in pkt.decode():
-                        for rf in resampler.resample(frm):
-                            remaining = a_target - a_pts
-                            if rf.samples > remaining:
-                                arr = rf.to_ndarray()[:, :remaining]
-                                rf  = _av.AudioFrame.from_ndarray(
-                                    arr, format='fltp', layout='stereo')
-                                rf.sample_rate = 44100
-                            rf.pts = a_pts
-                            for ap in out_a.encode(rf):
-                                out_c.mux(ap)
-                            a_pts += rf.samples
-                except Exception:
-                    continue
-
-            for ap in out_a.encode(None):
-                out_c.mux(ap)
-            a_in.close()
-
-        except Exception as ae:
-            log.warning(f'[PyAV] audio mux error: {ae}')
-        finally:
-            try:
-                os.unlink(tmp_audio)
-            except Exception:
-                pass
+    # Audio is muxed into the closed video-only file by FFmpeg below.
 
     # â”€â”€ 8. CLOSE + VALIDATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
@@ -1048,4 +1162,5 @@ if __name__ == '__main__':
     else:
         print('âœ—  Render failed â€” check logs above')
         sys.exit(1)
+
 
