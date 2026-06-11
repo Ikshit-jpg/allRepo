@@ -1,0 +1,13 @@
+stages: [test]
+
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+taste_system_tests:
+  stage: test
+  image: python:3.11
+  rules:
+    - exists: ["ARCHIVE 2/tests/test_taste_system.py"]
+  script:
+    - python "ARCHIVE 2/tests/test_taste_system.py"

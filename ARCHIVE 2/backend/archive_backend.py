@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hmac
 import io
 import json
 import logging
@@ -197,7 +198,19 @@ sys.dont_write_bytecode = True
 # =============================================================================
 
 app = Flask(__name__)
-CORS(app)
+# CORS: restrict to explicit origins (default = local dev only).
+# In production set ARCHIVE_CORS_ORIGINS="https://yourapp.com,https://other.com".
+_cors_origins = [
+    o.strip()
+    for o in os.getenv(
+        "ARCHIVE_CORS_ORIGINS",
+        "http://localhost:5000,http://127.0.0.1:5000,"
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:8000,http://127.0.0.1:8000",
+    ).split(",")
+    if o.strip()
+]
+CORS(app, origins=_cors_origins, supports_credentials=False)
 BACKEND_BUILD = "2026-03-04-runtime-variation7-hardmusicfix"
 API_DEBUG = os.getenv("ARCHIVE_API_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 ARCHIVE_VARIATION_MODE = os.getenv("ARCHIVE_VARIATION_MODE", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -337,7 +350,8 @@ def _before_request_hook():
         # Allow unauthenticated access to static files and the health endpoint.
         if path.startswith("/api/") and path != "/api/health":
             provided_key = request.headers.get("X-API-Key", "").strip()
-            if provided_key != ARCHIVE_API_KEY:
+            # Constant-time comparison prevents timing side-channel attacks.
+            if not hmac.compare_digest(provided_key, ARCHIVE_API_KEY):
                 logger.warning(
                     "[%s] AUTH DENIED %s %s from %s",
                     g.request_id, request.method, path, request.remote_addr,
@@ -8473,8 +8487,10 @@ def render() -> Any:
                     "labels_csv": str((OUTPUT_DIR / "segment_labels.csv").name),
                     "render_url": f"/api/output/{output_name}",
                     "download_url": f"/api/download/{output_name}",
+                    "degraded": True,
+                    "edited": False,
                     "warning": f"OSError fallback used ({fallback_mode}): {exc}",
-                    "debug_traceback": trace[-2500:],
+                    **({"debug_traceback": trace[-2500:]} if API_DEBUG else {}),
                 }
             )
         except Exception:
@@ -8520,8 +8536,10 @@ def render() -> Any:
                     "labels_csv": str((OUTPUT_DIR / "segment_labels.csv").name),
                     "render_url": f"/api/output/{output_name}",
                     "download_url": f"/api/download/{output_name}",
+                    "degraded": True,
+                    "edited": False,
                     "warning": f"Exception fallback used (passthrough_copy): {type(exc).__name__}: {exc}",
-                    "debug_traceback": trace[-2500:],
+                    **({"debug_traceback": trace[-2500:]} if API_DEBUG else {}),
                 }
             )
         except Exception:
@@ -8538,7 +8556,11 @@ def render() -> Any:
 
 @app.get("/api/output/<path:filename>")
 def output_file(filename: str) -> Any:
-    return send_from_directory(OUTPUT_DIR, filename, as_attachment=False)
+    # Outputs are always flat files: reject any path component (traversal guard).
+    safe_name = Path(filename).name
+    if safe_name != filename:
+        return jsonify({"error": "invalid filename"}), 400
+    return send_from_directory(OUTPUT_DIR, safe_name, as_attachment=False)
 
 
 @app.get("/api/download/<path:filename>")
@@ -8568,6 +8590,15 @@ def download_file(filename: str) -> Any:
 
 @app.get("/api/phonks/<path:filename>")
 def phonk_file(filename: str) -> Any:
+    # Phonk tracks may live in subfolders: allow relative paths but verify the
+    # resolved target stays inside PHONK_DIR (traversal/symlink guard).
+    base = PHONK_DIR.resolve()
+    try:
+        target = (base / filename).resolve()
+        if not target.is_relative_to(base) or not target.is_file():
+            return jsonify({"error": "invalid path"}), 400
+    except (OSError, ValueError):
+        return jsonify({"error": "invalid path"}), 400
     return send_from_directory(PHONK_DIR, filename, as_attachment=False)
 
 
