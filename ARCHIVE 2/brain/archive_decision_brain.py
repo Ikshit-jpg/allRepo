@@ -166,6 +166,96 @@ class BeatAnalysis:
     energy_curve: List[float] # RMS energy per second
     duration: float
 
+
+def _sections_from_energy(beats: List[float], drops: List[float],
+                          energy_curve: List[float], dur: float) -> List[str]:
+    """Label each beat with a section derived from the ACTUAL audio energy,
+    not fixed timeline percentages. Every song gets its own structure:
+    real buildups, real drops, real quiet breaks.
+
+    energy_curve is RMS at ~10 samples/second (see analyze_music).
+    Returns one label per beat from:
+    intro / buildup / drop / chorus / break / outro
+    """
+    if not beats:
+        return []
+
+    # Fallback: legacy percentage template (no energy data available)
+    if not energy_curve or dur <= 0:
+        out: List[str] = []
+        for b in beats:
+            p = b / max(dur, 1e-6)
+            if p < 0.08:   out.append('intro')
+            elif p < 0.22: out.append('buildup')
+            elif p < 0.40: out.append('drop')
+            elif p < 0.56: out.append('chorus')
+            elif p < 0.65: out.append('break')
+            elif p < 0.80: out.append('buildup')
+            elif p < 0.92: out.append('chorus')
+            else:          out.append('outro')
+        return out
+
+    # 1. Smooth (1s moving average) + normalize to 0..1
+    n = len(energy_curve)
+    fps = n / dur  # samples per second (~10)
+    win = max(1, int(fps))
+    smoothed: List[float] = []
+    for i in range(n):
+        lo, hi = max(0, i - win), min(n, i + win + 1)
+        seg = energy_curve[lo:hi]
+        smoothed.append(sum(seg) / len(seg))
+    peak = max(smoothed) or 1.0
+    smoothed = [e / peak for e in smoothed]
+
+    def e_at(t: float) -> float:
+        i = min(n - 1, max(0, int(t * fps)))
+        return smoothed[i]
+
+    # 2. Intro = until the track FIRST reaches ~45% of peak energy (cap 15%)
+    intro_end = 0.0
+    for i, e in enumerate(smoothed):
+        if e >= 0.45:
+            intro_end = i / fps
+            break
+    intro_end = min(intro_end, dur * 0.15)
+
+    # 3. Outro = after the LAST time energy stays above 40% of peak
+    outro_start = dur
+    for i in range(n - 1, -1, -1):
+        if smoothed[i] >= 0.40:
+            outro_start = i / fps
+            break
+    outro_start = max(outro_start, dur * 0.85)
+
+    sections: List[str] = []
+    for b in beats:
+        if b <= intro_end:
+            sections.append('intro')
+            continue
+        if b >= outro_start:
+            sections.append('outro')
+            continue
+        # Impact window right after a detected drop
+        if any(0.0 <= b - d <= 1.2 for d in drops):
+            sections.append('drop')
+            continue
+        e = e_at(b)
+        slope = e_at(b + 1.5) - e_at(max(0.0, b - 1.5))
+        # Approaching a drop with non-falling energy -> buildup (tension)
+        if any(0.0 < d - b <= 4.0 for d in drops) and slope >= -0.02:
+            sections.append('buildup')
+            continue
+        if e >= 0.62:
+            sections.append('chorus')      # sustained high energy
+        elif e <= 0.30:
+            sections.append('break')       # genuinely quiet moment
+        elif slope > 0.04:
+            sections.append('buildup')     # mid energy, rising
+        else:
+            sections.append('break')       # mid energy, steady/falling
+    return sections
+
+
 def analyze_music(music_path: str, bpm_override: float = 0) -> BeatAnalysis:
     """Full music analysis using librosa."""
     try:
@@ -202,18 +292,9 @@ def analyze_music(music_path: str, bpm_override: float = 0) -> BeatAnalysis:
                 if not drops or t - drops[-1] > 2.0:
                     drops.append(t)
 
-        # Section labels per beat
-        sections = []
-        for i, b in enumerate(beats):
-            p = b / dur
-            if p < 0.08:    sections.append('intro')
-            elif p < 0.22:  sections.append('buildup')
-            elif p < 0.40:  sections.append('drop')
-            elif p < 0.56:  sections.append('chorus')
-            elif p < 0.65:  sections.append('break')
-            elif p < 0.80:  sections.append('buildup')
-            elif p < 0.92:  sections.append('chorus')
-            else:           sections.append('outro')
+        # Section labels per beat — derived from the ACTUAL energy curve,
+        # so every song gets its own structure (no fixed template).
+        sections = _sections_from_energy(beats, drops, energy_curve, dur)
 
         print(f"[Brain] BPM={bpm:.1f} Beats={len(beats)} Drops={len(drops)}")
         return BeatAnalysis(bpm, beats, drops, sections, energy_curve, dur)
