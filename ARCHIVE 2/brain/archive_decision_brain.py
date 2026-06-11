@@ -111,19 +111,38 @@ class BeatCurve:
     This is the core of the beat-sync system.
     Every effect reads from this — not a simple if/beat_hit check.
     """
-    def __init__(self, beat_times: List[float], drop_times: List[float], bpm: float):
+    def __init__(self, beat_times: List[float], drop_times: List[float], bpm: float,
+                 energy_curve: Optional[List[float]] = None, duration: float = 0.0):
         self.beats = sorted(beat_times)
         self.drops = sorted(drop_times)
         self.bpm = bpm
         self.beat_interval = 60.0 / max(1, bpm)
         self._cache: Dict[float, float] = {}
+        # Normalized RMS curve (10 samples/sec) so energy reflects LOUDNESS
+        self._rms: List[float] = []
+        self._rms_fps: float = 0.0
+        if energy_curve and duration > 0:
+            peak = max(energy_curve) or 1.0
+            self._rms = [min(1.0, e / peak) for e in energy_curve]
+            self._rms_fps = len(energy_curve) / duration
+
+    def rms_at(self, t: float) -> float:
+        """Normalized loudness 0..1 at time t, or -1 if no energy data."""
+        if not self._rms:
+            return -1.0
+        i = min(len(self._rms) - 1, max(0, int(t * self._rms_fps)))
+        return self._rms[i]
 
     def energy_at(self, t: float) -> float:
-        """Returns 0..1 energy at time t. 1.0 = just hit a hard beat."""
-        # Find nearest beat
+        """Returns 0..1 energy at time t: beat proximity scaled by REAL
+        loudness. A quiet verse with a steady kick no longer reads as the
+        same energy as the climax."""
         nearest_dist = min((abs(t - b) for b in self.beats), default=9999)
-        if nearest_dist > 0.5: return 0.0
-        return Curve.beat_decay(nearest_dist)
+        beat_comp = 0.0 if nearest_dist > 0.5 else Curve.beat_decay(nearest_dist)
+        rms = self.rms_at(t)
+        if rms < 0:  # no energy data attached — legacy behavior
+            return beat_comp
+        return beat_comp * (0.35 + 0.65 * rms)
 
     def is_drop(self, t: float, tol: float = 0.18) -> bool:
         return any(abs(t - d) < tol for d in self.drops)
@@ -165,6 +184,97 @@ class BeatAnalysis:
     sections: List[str]       # section labels per beat
     energy_curve: List[float] # RMS energy per second
     duration: float
+    downbeats: List[float] = field(default_factory=list)  # bar starts (the "1")
+
+
+def _sections_from_energy(beats: List[float], drops: List[float],
+                          energy_curve: List[float], dur: float) -> List[str]:
+    """Label each beat with a section derived from the ACTUAL audio energy,
+    not fixed timeline percentages. Every song gets its own structure:
+    real buildups, real drops, real quiet breaks.
+
+    energy_curve is RMS at ~10 samples/second (see analyze_music).
+    Returns one label per beat from:
+    intro / buildup / drop / chorus / break / outro
+    """
+    if not beats:
+        return []
+
+    # Fallback: legacy percentage template (no energy data available)
+    if not energy_curve or dur <= 0:
+        out: List[str] = []
+        for b in beats:
+            p = b / max(dur, 1e-6)
+            if p < 0.08:   out.append('intro')
+            elif p < 0.22: out.append('buildup')
+            elif p < 0.40: out.append('drop')
+            elif p < 0.56: out.append('chorus')
+            elif p < 0.65: out.append('break')
+            elif p < 0.80: out.append('buildup')
+            elif p < 0.92: out.append('chorus')
+            else:          out.append('outro')
+        return out
+
+    # 1. Smooth (1s moving average) + normalize to 0..1
+    n = len(energy_curve)
+    fps = n / dur  # samples per second (~10)
+    win = max(1, int(fps))
+    smoothed: List[float] = []
+    for i in range(n):
+        lo, hi = max(0, i - win), min(n, i + win + 1)
+        seg = energy_curve[lo:hi]
+        smoothed.append(sum(seg) / len(seg))
+    peak = max(smoothed) or 1.0
+    smoothed = [e / peak for e in smoothed]
+
+    def e_at(t: float) -> float:
+        i = min(n - 1, max(0, int(t * fps)))
+        return smoothed[i]
+
+    # 2. Intro = until the track FIRST reaches ~45% of peak energy (cap 15%)
+    intro_end = 0.0
+    for i, e in enumerate(smoothed):
+        if e >= 0.45:
+            intro_end = i / fps
+            break
+    intro_end = min(intro_end, dur * 0.15)
+
+    # 3. Outro = after the LAST time energy stays above 40% of peak
+    outro_start = dur
+    for i in range(n - 1, -1, -1):
+        if smoothed[i] >= 0.40:
+            outro_start = i / fps
+            break
+    outro_start = max(outro_start, dur * 0.85)
+
+    sections: List[str] = []
+    for b in beats:
+        if b <= intro_end:
+            sections.append('intro')
+            continue
+        if b >= outro_start:
+            sections.append('outro')
+            continue
+        # Impact window right after a detected drop
+        if any(0.0 <= b - d <= 1.2 for d in drops):
+            sections.append('drop')
+            continue
+        e = e_at(b)
+        slope = e_at(b + 1.5) - e_at(max(0.0, b - 1.5))
+        # Approaching a drop with non-falling energy -> buildup (tension)
+        if any(0.0 < d - b <= 4.0 for d in drops) and slope >= -0.02:
+            sections.append('buildup')
+            continue
+        if e >= 0.62:
+            sections.append('chorus')      # sustained high energy
+        elif e <= 0.30:
+            sections.append('break')       # genuinely quiet moment
+        elif slope > 0.04:
+            sections.append('buildup')     # mid energy, rising
+        else:
+            sections.append('break')       # mid energy, steady/falling
+    return sections
+
 
 def analyze_music(music_path: str, bpm_override: float = 0) -> BeatAnalysis:
     """Full music analysis using librosa."""
@@ -190,33 +300,57 @@ def analyze_music(music_path: str, bpm_override: float = 0) -> BeatAnalysis:
         rms = librosa.feature.rms(y=y, hop_length=hop)[0]
         energy_curve = rms.tolist()
 
-        # Find drops: sudden energy spikes after low energy
+        # Find drops: RMS spikes + sub-bass surges + onset peaks.
+        # Modern phonk/trap is brick-wall mastered (flat RMS), so pure RMS
+        # spike detection misses drops — bass energy + onsets catch them.
         drops = []
         win = max(1, sr // hop)  # 1-second window
-        for i in range(win, len(rms) - win):
-            prev_e = float(np.mean(rms[max(0,i-win*4):i]))
-            curr_e = float(rms[i])
-            if curr_e > prev_e * 1.8 and curr_e > 0.05:
-                t = i * hop / sr
+        try:
+            import scipy.signal as _sig
+            sos = _sig.butter(4, 150, btype='low', fs=sr, output='sos')
+            y_bass = _sig.sosfilt(sos, y)
+            bass_rms = librosa.feature.rms(y=y_bass, hop_length=hop)[0]
+        except Exception:
+            bass_rms = rms
+        try:
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+            onset_peak = float(np.percentile(onset_env, 97)) or 1.0
+        except Exception:
+            onset_env = np.zeros_like(rms)
+            onset_peak = 1.0
+
+        n_frames = min(len(rms), len(bass_rms))
+        for i in range(win, n_frames - win):
+            t = i * hop / sr
+            prev_e = float(np.mean(rms[max(0, i - win * 4):i]))
+            prev_b = float(np.mean(bass_rms[max(0, i - win * 4):i]))
+            rms_spike = float(rms[i]) > prev_e * 1.8 and float(rms[i]) > 0.05
+            bass_spike = float(bass_rms[i]) > max(1e-5, prev_b) * 2.2 and float(bass_rms[i]) > 0.03
+            onset_hit = i < len(onset_env) and float(onset_env[i]) >= onset_peak
+            if rms_spike or (bass_spike and onset_hit):
                 # Avoid duplicates within 2 seconds
                 if not drops or t - drops[-1] > 2.0:
                     drops.append(t)
 
-        # Section labels per beat
-        sections = []
-        for i, b in enumerate(beats):
-            p = b / dur
-            if p < 0.08:    sections.append('intro')
-            elif p < 0.22:  sections.append('buildup')
-            elif p < 0.40:  sections.append('drop')
-            elif p < 0.56:  sections.append('chorus')
-            elif p < 0.65:  sections.append('break')
-            elif p < 0.80:  sections.append('buildup')
-            elif p < 0.92:  sections.append('chorus')
-            else:           sections.append('outro')
+        # Section labels per beat — derived from the ACTUAL energy curve,
+        # so every song gets its own structure (no fixed template).
+        sections = _sections_from_energy(beats, drops, energy_curve, dur)
 
-        print(f"[Brain] BPM={bpm:.1f} Beats={len(beats)} Drops={len(drops)}")
-        return BeatAnalysis(bpm, beats, drops, sections, energy_curve, dur)
+        # Downbeats: humans cut on the "1" of the bar, not beat 3.
+        # Pick the 4-beat phase whose beats land on the most energy.
+        downbeats: List[float] = []
+        if len(beats) >= 8:
+            best_phase, best_score = 0, -1.0
+            for phase in range(4):
+                idxs = [min(len(rms) - 1, int(b * sr / hop)) for b in beats[phase::4]]
+                score = float(np.mean([float(rms[j]) for j in idxs])) if idxs else 0.0
+                if score > best_score:
+                    best_phase, best_score = phase, score
+            downbeats = beats[best_phase::4]
+
+        print(f"[Brain] BPM={bpm:.1f} Beats={len(beats)} Drops={len(drops)} Downbeats={len(downbeats)}")
+        return BeatAnalysis(bpm, beats, drops, sections, energy_curve, dur,
+                            downbeats=downbeats)
 
     except ImportError:
         print("[Brain] librosa not found, using synthetic beats")
@@ -265,31 +399,132 @@ class SceneInfo:
     width: int = 1280
     height: int = 720
 
-def analyze_clip(path: str, engine: str) -> SceneInfo:
-    """Call C++ engine to analyze a clip."""
+_CLIP_CACHE_DIR = Path(tempfile.gettempdir()) / 'archive_clip_cache'
+
+
+def _clip_cache_key(path: str) -> str:
+    import hashlib
     try:
-        result = subprocess.run(
-            [engine, 'analyze_clip', path],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0 and result.stdout:
-            d = json.loads(result.stdout)
-            return SceneInfo(
-                path=path,
-                motion=d.get('motion', 0.5),
-                brightness=d.get('brightness', 0.5),
-                sharpness=d.get('sharpness', 0.5),
-                saturation=d.get('saturation', 0.5),
-                scene_type=d.get('scene_type', 'action'),
-                edit_value=d.get('edit_value', 0.5),
-                duration=d.get('duration', 5.0),
-                fps=d.get('fps', 30.0),
-                width=d.get('width', 1280),
-                height=d.get('height', 720),
+        st = os.stat(path)
+        raw = f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}"
+    except OSError:
+        raw = os.path.abspath(path)
+    return hashlib.sha1(raw.encode('utf-8', 'replace')).hexdigest()
+
+
+def _python_analyze_clip(path: str) -> SceneInfo:
+    """Pure-Python clip analysis (OpenCV). Used when the C++ engine is
+    missing/broken. Previously every clip silently fell back to identical
+    0.5 defaults, so the brain was choosing effects blind."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return SceneInfo(path=path)
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return SceneInfo(path=path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
+    duration = (n_frames / fps) if (fps and n_frames) else 5.0
+
+    samples = 14
+    idxs = [int(n_frames * k / samples) for k in range(samples)] if n_frames else list(range(samples))
+    prev = None
+    motion_vals: List[float] = []
+    bright_vals: List[float] = []
+    sharp_vals: List[float] = []
+    sat_vals: List[float] = []
+    for fi in idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        small = cv2.resize(frame, (320, max(1, int(320 * frame.shape[0] / max(1, frame.shape[1])))))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        bright_vals.append(float(gray.mean()) / 255.0)
+        sharp_vals.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+        sat_vals.append(float(hsv[:, :, 1].mean()) / 255.0)
+        if prev is not None:
+            motion_vals.append(float(np.mean(cv2.absdiff(prev, gray))) / 255.0)
+        prev = gray
+    cap.release()
+
+    motion = min(1.0, (sum(motion_vals) / len(motion_vals)) * 6.0) if motion_vals else 0.5
+    brightness = sum(bright_vals) / len(bright_vals) if bright_vals else 0.5
+    sharp_raw = sum(sharp_vals) / len(sharp_vals) if sharp_vals else 100.0
+    sharpness = min(1.0, sharp_raw / 600.0)
+    saturation = sum(sat_vals) / len(sat_vals) if sat_vals else 0.5
+    motion_peak = (max(motion_vals) * 6.0) if motion_vals else motion
+
+    if motion > 0.55 and motion_peak > 1.4 * max(0.01, motion):
+        scene_type = 'impact'
+    elif motion > 0.45:
+        scene_type = 'action'
+    elif motion < 0.18 and saturation < 0.35:
+        scene_type = 'quiet'
+    elif motion < 0.25:
+        scene_type = 'scenery'
+    else:
+        scene_type = 'reaction'
+
+    return SceneInfo(
+        path=path, motion=round(motion, 3), brightness=round(brightness, 3),
+        sharpness=round(sharpness, 3), saturation=round(saturation, 3),
+        scene_type=scene_type, edit_value=0.5, duration=round(duration, 2),
+        fps=float(fps), width=width, height=height,
+    )
+
+
+def analyze_clip(path: str, engine: str) -> SceneInfo:
+    """Analyze a clip: C++ engine first, Python/OpenCV fallback, disk-cached.
+    The cache (keyed by path+size+mtime) means the same source clip is
+    never re-analyzed across renders — a big speed win."""
+    cache_file = _CLIP_CACHE_DIR / f"{_clip_cache_key(path)}.json"
+    try:
+        if cache_file.exists():
+            d = json.loads(cache_file.read_text(encoding='utf-8'))
+            return SceneInfo(**d)
+    except Exception:
+        pass
+
+    info: Optional[SceneInfo] = None
+    if engine and os.path.exists(engine):
+        try:
+            result = subprocess.run(
+                [engine, 'analyze_clip', path],
+                capture_output=True, text=True, timeout=30
             )
-    except Exception as e:
-        print(f"[Brain] analyze_clip failed for {path}: {e}")
-    return SceneInfo(path=path)
+            if result.returncode == 0 and result.stdout:
+                d = json.loads(result.stdout)
+                info = SceneInfo(
+                    path=path,
+                    motion=d.get('motion', 0.5),
+                    brightness=d.get('brightness', 0.5),
+                    sharpness=d.get('sharpness', 0.5),
+                    saturation=d.get('saturation', 0.5),
+                    scene_type=d.get('scene_type', 'action'),
+                    edit_value=d.get('edit_value', 0.5),
+                    duration=d.get('duration', 5.0),
+                    fps=d.get('fps', 30.0),
+                    width=d.get('width', 1280),
+                    height=d.get('height', 720),
+                )
+        except Exception as e:
+            print(f"[Brain] C++ analyze_clip failed for {path}: {e}")
+
+    if info is None:
+        info = _python_analyze_clip(path)
+
+    try:
+        _CLIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(vars(info)), encoding='utf-8')
+    except Exception:
+        pass
+    return info
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -502,34 +737,66 @@ class VelocityEngine:
                                segments: List[VelocitySegment]) -> bool:
         """Apply velocity segments using FFmpeg setpts filter."""
         if not segments: return False
-        # Calculate overall average speed
-        total_out_dur = 0
+
+        # REAL speed ramps: each segment becomes its own trim+setpts chain.
+        # Ramped segments are subdivided into eased speed steps, then
+        # concatenated in ONE encode pass (no quality loss from multi-pass).
+        # The old version averaged everything into a single setpts value,
+        # which turned a dramatic 0.25x->1x ramp into constant slow-mo.
+        steps: List[Tuple[float, float, float]] = []  # (start, end, speed)
         for seg in segments:
             src_dur = seg.source_end - seg.source_start
-            avg_speed = (seg.speed_start + seg.speed_end) / 2
-            total_out_dur += src_dur / avg_speed if avg_speed > 0 else src_dur
+            if src_dur <= 0.01:
+                continue
+            ramp = abs(seg.speed_end - seg.speed_start)
+            n_steps = 1 if ramp < 0.05 else max(2, min(6, int(src_dur / 0.25)))
+            for k in range(n_steps):
+                f0 = k / n_steps
+                f1 = (k + 1) / n_steps
+                fm = (f0 + f1) / 2
+                eased = fm * fm * (3 - 2 * fm)  # smoothstep for perceived smoothness
+                spd = seg.speed_start + (seg.speed_end - seg.speed_start) * eased
+                steps.append((seg.source_start + src_dur * f0,
+                              seg.source_start + src_dur * f1,
+                              max(0.1, min(5.0, spd))))
 
-        # Simple: single speed ramp using setpts
-        # For complex ramps, we'd need frame extraction — simplified here
-        avg_speed = sum(s.speed_start + s.speed_end for s in segments) / (2 * max(1, len(segments)))
-        avg_speed = max(0.1, min(5.0, avg_speed))
-
-        if abs(avg_speed - 1.0) < 0.05:
-            # No change needed
+        if not steps or (len(steps) == 1 and abs(steps[0][2] - 1.0) < 0.05):
             import shutil
             shutil.copy2(input_path, output_path)
             return True
 
-        # FFmpeg setpts for speed change
-        pts_factor = 1.0 / avg_speed
+        parts = []
+        labels = []
+        for i, (s, e, spd) in enumerate(steps):
+            parts.append(
+                f"[0:v]trim=start={s:.3f}:end={e:.3f},"
+                f"setpts=(PTS-STARTPTS)/{spd:.4f}[v{i}]")
+            labels.append(f"[v{i}]")
+        parts.append(f"{''.join(labels)}concat=n={len(steps)}:v=1:a=0[vout]")
+        graph = ';'.join(parts)
+
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
             '-i', input_path,
-            '-vf', f'setpts={pts_factor:.4f}*PTS',
+            '-filter_complex', graph,
+            '-map', '[vout]',
             '-an',  # drop audio (will be remixed later)
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
             output_path
         ]
+        try:
+            result = subprocess.run(cmd, timeout=180)
+            if result.returncode == 0:
+                return True
+        except Exception as e:
+            print(f"[Velocity] Ramp filtergraph failed: {e}")
+
+        # Last-resort fallback: average-speed setpts (legacy behavior)
+        avg_speed = max(0.1, min(5.0, sum(s[2] for s in steps) / len(steps)))
+        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+               '-i', input_path, '-vf', f'setpts={1.0 / avg_speed:.4f}*PTS',
+               '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
+               output_path]
         try:
             result = subprocess.run(cmd, timeout=120)
             return result.returncode == 0
@@ -697,7 +964,8 @@ class DecisionEngine:
         """
         beats = beat_analysis.beats
         drops = beat_analysis.drops
-        bc = BeatCurve(beats, drops, beat_analysis.bpm)
+        bc = BeatCurve(beats, drops, beat_analysis.bpm,
+                       beat_analysis.energy_curve, beat_analysis.duration)
         vel_engine = VelocityEngine(bc)
 
         # ── Pass 1: Score clips ──
@@ -714,16 +982,24 @@ class DecisionEngine:
         t = 0.0
         prev_section = 'intro'
 
+        # Energy-derived section lookup (no duplicated percentage template)
+        sections_by_beat = (list(zip(beats, beat_analysis.sections))
+                            if beat_analysis.sections else [])
+
         for i, scene in enumerate(scenes):
-            p = (t + clip_dur * 0.5) / total_dur
-            if p < 0.08:   section = 'intro'
-            elif p < 0.22: section = 'buildup'
-            elif p < 0.40: section = 'drop'
-            elif p < 0.56: section = 'chorus'
-            elif p < 0.65: section = 'break'
-            elif p < 0.80: section = 'buildup'
-            elif p < 0.92: section = 'chorus'
-            else:          section = 'outro'
+            mid = t + clip_dur * 0.5
+            if sections_by_beat:
+                section = min(sections_by_beat, key=lambda bs: abs(bs[0] - mid))[1]
+            else:
+                p = mid / total_dur
+                if p < 0.08:   section = 'intro'
+                elif p < 0.22: section = 'buildup'
+                elif p < 0.40: section = 'drop'
+                elif p < 0.56: section = 'chorus'
+                elif p < 0.65: section = 'break'
+                elif p < 0.80: section = 'buildup'
+                elif p < 0.92: section = 'chorus'
+                else:          section = 'outro'
 
             beat_energy = bc.section_energy(t, clip_dur)
             is_drop = bc.is_drop(t) or bc.is_drop(t + clip_dur * 0.5)
@@ -961,7 +1237,7 @@ def run_amv(clips: List[str], music: str, output: str, mood: str,
     print("[1/6] Analyzing music...")
     ba = analyze_music(music, bpm) if music else _synthetic_beats(bpm or 130, total_dur)
     if not total_dur: total_dur = ba.duration
-    bc = BeatCurve(ba.beats, ba.drops, ba.bpm)
+    bc = BeatCurve(ba.beats, ba.drops, ba.bpm, ba.energy_curve, ba.duration)
     vel_engine = VelocityEngine(bc)
 
     # ── Clip analysis ──
