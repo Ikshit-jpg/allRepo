@@ -14,8 +14,39 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # type: ignore[assignment]
+
+try:
+    from .taste_system import TasteFilter
+except ImportError:
+    try:
+        from taste_system import TasteFilter  # type: ignore
+    except ImportError:
+        TasteFilter = None  # type: ignore[assignment]
+
+try:
+    from .amv_brain import AMVBrain as CinematicDirector
+    from .director import ShotFeatures as DirectorShotFeatures
+except ImportError:
+    try:
+        from amv_brain import AMVBrain as CinematicDirector  # type: ignore
+        from director import ShotFeatures as DirectorShotFeatures  # type: ignore
+    except ImportError:
+        try:
+            from .director import DirectorBrain as CinematicDirector
+            from .director import ShotFeatures as DirectorShotFeatures
+        except ImportError:
+            try:
+                from director import DirectorBrain as CinematicDirector  # type: ignore
+                from director import ShotFeatures as DirectorShotFeatures  # type: ignore
+            except ImportError:
+                CinematicDirector = None  # type: ignore[assignment]
+                DirectorShotFeatures = None  # type: ignore[assignment]
 
 try:
     import librosa
@@ -28,12 +59,14 @@ FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
 CORES = max(2, min(8, os.cpu_count() or 4))
 FRAME_ENGINE_EXE = os.getenv("ARCHIVE_FRAME_ENGINE_EXE") or str(Path(__file__).resolve().parent.parent / "cpp" / "archive_frame_engine.exe")
-BRAIN_MAX_RUNTIME_SEC = int(float(os.getenv("ARCHIVE_BRAIN_MAX_RUNTIME_SEC", "360")))
-BRAIN_SEGMENT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_SEGMENT_TIMEOUT_SEC", "45")))
-BRAIN_FRAME_ENGINE_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_FRAME_ENGINE_TIMEOUT_SEC", "60")))
-BRAIN_TRANSITION_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TRANSITION_TIMEOUT_SEC", "20")))
-BRAIN_CONCAT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_CONCAT_TIMEOUT_SEC", "90")))
+BRAIN_MAX_RUNTIME_SEC = int(float(os.getenv("ARCHIVE_BRAIN_MAX_RUNTIME_SEC", "1740")))
+BRAIN_SEGMENT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_SEGMENT_TIMEOUT_SEC", "400")))
+BRAIN_FRAME_ENGINE_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_FRAME_ENGINE_TIMEOUT_SEC", "75")))
+BRAIN_TRANSITION_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TRANSITION_TIMEOUT_SEC", "45")))
+BRAIN_CONCAT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_CONCAT_TIMEOUT_SEC", "180")))
 BRAIN_MAX_DIMENSION = int(float(os.getenv("ARCHIVE_BRAIN_MAX_DIMENSION", "1280")))
+BRAIN_CPP_MAX_SEGMENT_SEC = float(os.getenv("ARCHIVE_BRAIN_CPP_MAX_SEGMENT_SEC", "2.8"))
+BRAIN_CPP_FAILURE_LIMIT = int(float(os.getenv("ARCHIVE_BRAIN_CPP_FAILURE_LIMIT", "1")))
 
 
 def _log(msg: str, tag: str = "BRAIN") -> None:
@@ -43,16 +76,22 @@ def _log(msg: str, tag: str = "BRAIN") -> None:
 def _run(cmd: list[str], timeout: int = 600) -> tuple[bool, str]:
     timeout = max(5, min(int(timeout), BRAIN_MAX_RUNTIME_SEC))
     started = time.time()
-    _log(f"exec timeout={timeout}s cmd={' '.join(str(part) for part in cmd[:8])}", "CMD")
+    cmd_preview = ' '.join(str(part) for part in cmd[:8])
+    _log(f"exec timeout={timeout}s cmd={cmd_preview}", "CMD")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
         elapsed = time.time() - started
         if elapsed > max(10.0, timeout * 0.6):
             _log(f"slow command elapsed={elapsed:.1f}s rc={proc.returncode}", "PERF")
-        return proc.returncode == 0, (proc.stderr or "")[-500:]
+        stderr = (proc.stderr or "")[-1000:]
+        if proc.returncode != 0 and stderr:
+            _log(f"command failed (rc={proc.returncode}): {stderr[:200]}", "ERR")
+        return proc.returncode == 0, stderr
     except subprocess.TimeoutExpired:
+        _log(f"command timed out after {timeout}s: {' '.join(str(p) for p in cmd[:6])}", "ERR")
         return False, f"timeout after {timeout}s"
     except Exception as exc:
+        _log(f"command exception: {str(exc)[:200]}", "ERR")
         return False, str(exc)
 
 
@@ -100,6 +139,8 @@ def _probe(path: str | Path) -> dict[str, Any]:
             "has_audio": has_audio,
         }
     except Exception:
+        if cv2 is None:
+            return {"w": 1280, "h": 720, "fps": 30.0, "dur": 30.0, "has_audio": False}
         cap = cv2.VideoCapture(str(path))
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
@@ -244,6 +285,8 @@ class SceneUnderstandingEngine:
         self._face_cascade = self._load_face_cascade()
 
     def _load_face_cascade(self) -> Any:
+        if cv2 is None:
+            return None
         cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         if os.path.exists(cascade_path):
             cascade = cv2.CascadeClassifier(cascade_path)
@@ -258,6 +301,8 @@ class SceneUnderstandingEngine:
         n_samples: int = 6,
     ) -> SceneRead:
         scene = SceneRead(start=start, end=end, duration=max(0.01, end - start))
+        if cv2 is None:
+            return scene
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             return scene
@@ -468,13 +513,19 @@ class SceneUnderstandingEngine:
 
 
 class RestraintEngine:
-    HEAVY_RATE = {"hype": 0.55, "dark": 0.45, "dramatic": 0.40, "sad": 0.25, "chill": 0.20}
-    MAX_DRY_STREAK = {"hype": 3, "dark": 4, "dramatic": 4, "sad": 6, "chill": 8}
+    HEAVY_RATE = {"hype": 0.46, "dark": 0.38, "dramatic": 0.40, "sad": 0.22, "chill": 0.16}
+    MAX_DRY_STREAK = {"hype": 3, "dark": 4, "dramatic": 4, "sad": 6, "chill": 7}
+    MIN_HEAVY_GAP = {"hype": 1, "dark": 1, "dramatic": 1, "sad": 2, "chill": 2}
+    HEAVY_CAP_RATIO = {"hype": 0.42, "dark": 0.34, "dramatic": 0.36, "sad": 0.24, "chill": 0.18}
 
     def __init__(self, mood: str, total_segments: int) -> None:
         self.mood = mood
         self.total = total_segments
         self._since_last_big = 0
+        self._heavy_effect_history: list[int] = []
+        self._last_heavy_index = -999
+        cap_ratio = self.HEAVY_CAP_RATIO.get(mood, 0.34)
+        self._max_heavy = max(3, int(round(max(1, total_segments) * cap_ratio)))
 
     def should_fire_heavy(
         self,
@@ -484,30 +535,47 @@ class RestraintEngine:
         index: int,
         is_peak: bool,
     ) -> bool:
-        rate = self.HEAVY_RATE.get(self.mood, 0.4)
-        max_dry = self.MAX_DRY_STREAK.get(self.mood, 4)
-        self._since_last_big += 1
-        if is_peak and beat_energy > 0.80:
-            return self._fire()
-        if section == "drop" and beat_energy > 0.70:
-            return self._fire()
-        if self._since_last_big >= max_dry:
-            return self._fire()
-        # Keep openings alive: allow one signature opener instead of muting intro.
-        if section == "intro" and index < 2:
-            if self.mood in {"hype", "dark", "dramatic"} and (scene.edit_value > 0.58 or beat_energy > 0.62):
-                return self._fire()
-            if scene.scene_type in {"impact", "action"} and scene.edit_value > 0.50:
-                return self._fire()
         if scene.is_quiet and section != "drop":
             return False
         if scene.scene_type == "dialogue":
             return False
-        scene_prob = scene.edit_value * 0.40 + scene.emotional_intensity * 0.30 + beat_energy * 0.30
-        return self._fire() if scene_prob >= (1.0 - rate) else False
+        if len(self._heavy_effect_history) >= self._max_heavy:
+            return False
 
-    def _fire(self) -> bool:
+        min_gap = self.MIN_HEAVY_GAP.get(self.mood, 2)
+        if index - self._last_heavy_index < min_gap:
+            return False
+
+        if section == "intro" and index < 2:
+            if scene.scene_type in {"impact", "action"} and (scene.edit_value > 0.58 or beat_energy > 0.62):
+                return self._fire(index)
+            return False
+
+        if section == "drop" and beat_energy > 0.62:
+            return self._fire(index)
+
+        if is_peak and beat_energy > 0.68:
+            return self._fire(index)
+
+        position = index / max(1, self.total - 1)
+        if position > 0.88 and section == "outro":
+            return False
+
+        rate = self.HEAVY_RATE.get(self.mood, 0.2)
+        self._since_last_big += 1
+
+        max_dry = self.MAX_DRY_STREAK.get(self.mood, 6)
+        if self._since_last_big >= max_dry and (beat_energy > 0.52 or scene.edit_value > 0.58):
+            return self._fire(index)
+
+        scene_prob = scene.edit_value * 0.46 + beat_energy * 0.34 + scene.emotional_intensity * 0.12 + scene.motion * 0.08
+        threshold = 1.0 - rate
+        return self._fire(index) if scene_prob >= threshold else False
+
+    def _fire(self, index: int) -> bool:
         self._since_last_big = 0
+        self._last_heavy_index = index
+        self._heavy_effect_history.append(index)
         return True
 
     def _narrative_curve(self, position: float) -> float:
@@ -875,9 +943,11 @@ class BeatMusicAnalyzer:
 class MomentEffectDirector:
     """
     Converts scene reads into short-lived, curve-driven compositions.
-
-    This is intentionally separate from EffectTasteEngine: taste still handles
-    lightweight global grade, while the director decides moment choreography.
+    Now with:
+    - Personality/seed-based randomization (prevents repetition)
+    - Context-aware effect selection (matches scene content)
+    - Reduced heavy effect frequency
+    - Smarter transition logic (avoids same transition twice)
     """
 
     def __init__(self, mood: str, beat_map: dict[str, Any], style: dict[str, Any]) -> None:
@@ -886,6 +956,11 @@ class MomentEffectDirector:
         self.style = style
         self.frame_engine = Path(FRAME_ENGINE_EXE)
         self.available = self.frame_engine.exists()
+        # Seeded randomization for personality/reproducibility
+        self.seed = int(style.get("variation_seed", 42))
+        self.rng = np.random.RandomState(self.seed)
+        self._transition_history: list[str] = []
+        self._effect_history: list[str] = []
 
     def plan_segment(
         self,
@@ -898,10 +973,13 @@ class MomentEffectDirector:
     ) -> DirectedEffectPlan:
         beat_csv = self._local_beats_for_scene(scene)
         is_drop = section.type == "drop" or any(scene.start <= float(t) <= scene.end for t in self.beat_map.get("drop_times", []))
-        effect = self._choose_effect(scene, section, heavy, beat_energy)
-        animation = self._choose_animation(scene, section, heavy, index)
-        transition = self._choose_transition(scene, section, heavy, index)
+        
+        # Choose effect with personality and variety
+        effect = self._choose_effect_smart(scene, section, heavy, beat_energy, index)
+        animation = self._choose_animation_smart(scene, section, heavy, index)
+        transition = self._choose_transition_smart(scene, section, heavy, index)
         transition_frames = self._transition_frames(section, heavy)
+        
         wants_advanced = bool(self.style.get("advanced_compositor", True))
         wants_cpp_segments = bool(self.style.get("cpp_render_clip", False))
         use_frame_engine = (
@@ -911,6 +989,7 @@ class MomentEffectDirector:
             and scene.scene_type not in {"dialogue"}
             and (heavy or section.type in {"drop", "chorus"} or scene.scene_type in {"impact", "action", "reaction"})
         )
+        
         return DirectedEffectPlan(
             effect=effect,
             animation=animation,
@@ -931,8 +1010,13 @@ class MomentEffectDirector:
         next_plan: DirectedEffectPlan,
         index: int,
     ) -> str:
+        # Avoid using the same transition twice in a row
         if next_section.type == "drop" or next_plan.is_drop:
-            return "impact_cut" if next_scene.scene_type == "impact" else "flash_cut"
+            candidate = "impact_cut" if next_scene.scene_type == "impact" else "flash_cut"
+            if len(self._transition_history) > 0 and self._transition_history[-1] == candidate:
+                candidate = "whip_pan_right"  # fallback
+            return candidate
+        
         if prev_scene.motion_direction == "right" or next_scene.motion_direction == "right":
             return "whip_pan_right"
         if prev_scene.motion_direction == "up" or next_scene.motion_direction == "up":
@@ -945,50 +1029,103 @@ class MomentEffectDirector:
             return "glitch_cut"
         return next_plan.transition
 
-    def _choose_effect(self, scene: SceneRead, section: NarrativeSection, heavy: bool, beat_energy: float) -> str:
-        if scene.scene_type == "impact" or (heavy and beat_energy > 0.78):
-            return "impact_flash_combo"
+    def _choose_effect_smart(
+        self, scene: SceneRead, section: NarrativeSection, heavy: bool, beat_energy: float, index: int
+    ) -> str:
+        """Smart effect selection with variety and personality."""
+        
+        # For dialogue/quiet: always subtle
+        if scene.scene_type == "dialogue" or scene.is_quiet:
+            return self.rng.choice(["cinematic_grade", "atmospheric_grade", "portrait_enhance"])
+        
+        # For impact scenes at high beat energy
+        if scene.scene_type == "impact" and beat_energy > 0.75:
+            return self.rng.choice(["impact_flash_combo", "dark_surge"] if heavy else ["impact_flash_combo"])
+        
+        # For action scenes: vary based on section
         if scene.scene_type == "action":
             if section.type in {"drop", "chorus"}:
-                return "speed_blur_lines"
-            return "action"
+                return self.rng.choice(["speed_blur_lines", "action", "energy_aura"])
+            else:
+                return self.rng.choice(["action", "cinematic_grade"])
+        
+        # For reaction scenes
         if scene.scene_type == "reaction":
-            return "emotional_peak" if heavy else "portrait_enhance"
+            return "emotional_peak" if heavy else self.rng.choice(["portrait_enhance", "atmospheric_grade"])
+        
+        # For scenery/landscape
         if scene.scene_type == "scenery":
-            return "atmospheric_grade"
-        if self.mood == "dark" and heavy:
-            return "dark_surge"
-        if self.mood in {"hype", "dramatic"} and heavy:
-            return "energy_aura"
-        return "cinematic_grade"
+            return self.rng.choice(["atmospheric_grade", "cinematic_grade"])
+        
+        # Mood-based heavy effects (but avoid repeating immediately)
+        if heavy:
+            if self.mood == "dark":
+                candidates = ["dark_surge", "energy_aura"]
+                # Avoid if we just used this effect
+                if len(self._effect_history) > 0 and self._effect_history[-1] in candidates:
+                    candidates = ["cinematic_grade", "atmospheric_grade"]
+                return self.rng.choice(candidates)
+            elif self.mood in {"hype", "dramatic"}:
+                candidates = ["energy_aura", "impact_flash_combo"]
+                if len(self._effect_history) > 0 and self._effect_history[-1] in candidates:
+                    candidates = ["speed_blur_lines", "cinematic_grade"]
+                return self.rng.choice(candidates)
+        
+        # Default: return a subtle effect
+        return self.rng.choice(["cinematic_grade", "atmospheric_grade", "portrait_enhance"])
 
-    def _choose_animation(self, scene: SceneRead, section: NarrativeSection, heavy: bool, index: int) -> str:
+    def _choose_animation_smart(self, scene: SceneRead, section: NarrativeSection, heavy: bool, index: int) -> str:
+        """Smart animation selection with variety."""
+        
         if scene.scene_type == "impact":
-            return "camera_slam"
+            return self.rng.choice(["camera_slam", "handheld_shake"])
+        
         if scene.scene_type == "action":
             if scene.motion_direction == "right":
                 return "orbit_right"
-            return "parallax_zoom" if heavy else "zoom_pulse"
+            animations = ["parallax_zoom", "zoom_pulse", "handheld_shake"]
+            return self.rng.choice(animations)
+        
         if scene.scene_type == "reaction":
-            return "push_in_slow"
+            return self.rng.choice(["push_in_slow", "subtle_drift"])
+        
         if scene.scene_type in {"scenery", "quiet"}:
-            return "ken_burns_slow"
+            return self.rng.choice(["ken_burns_slow", "subtle_drift"])
+        
         if section.type == "drop" and index % 2 == 0:
-            return "handheld_shake"
-        return "subtle_drift"
+            return self.rng.choice(["handheld_shake", "camera_slam"])
+        
+        # Default to subtle
+        return self.rng.choice(["subtle_drift", "ken_burns_slow"])
 
-    def _choose_transition(self, scene: SceneRead, section: NarrativeSection, heavy: bool, index: int) -> str:
+    def _choose_transition_smart(self, scene: SceneRead, section: NarrativeSection, heavy: bool, index: int) -> str:
+        """Smart transition selection that avoids repetition."""
+        
         if section.type == "drop" or scene.scene_type == "impact":
-            return "impact_cut" if heavy else "flash_cut"
+            candidate = "impact_cut" if heavy else "flash_cut"
+            # Avoid repeating same transition
+            if len(self._transition_history) > 0 and self._transition_history[-1] == candidate:
+                candidate = self.rng.choice(["whip_pan_right", "cross_zoom"])
+            self._transition_history.append(candidate)
+            return candidate
+        
         if scene.motion_direction == "right":
             return "whip_pan_right"
         if scene.motion_direction == "up":
             return "whip_pan_up"
+        
         if scene.scene_type == "reaction":
             return "cross_zoom"
+        
+        # Mood-based transitions with variety
         if self.mood == "dark" and index % 3 == 0:
+            self._transition_history.append("glitch_cut")
             return "glitch_cut"
-        return "dissolve"
+        
+        # Default subtle transitions
+        candidate = self.rng.choice(["dissolve", "fade", "cross_fade"])
+        self._transition_history.append(candidate)
+        return candidate
 
     def _transition_frames(self, section: NarrativeSection, heavy: bool) -> int:
         fps = float(self.beat_map.get("fps", 30.0) or 30.0)
@@ -1008,6 +1145,24 @@ class MomentEffectDirector:
 
 
 class UnifiedRenderEngine:
+    TASTE_EFFECT_MAP = {
+        "zoom_burst_shake": ("impact_flash_combo", "camera_slam"),
+        "god_of_war": ("impact_flash_combo", "camera_slam"),
+        "camera_slam": ("impact_flash_combo", "camera_slam"),
+        "handheld_shake": ("energy_aura", "handheld_shake"),
+        "push_in_slow": ("cinematic_grade", "push_in_slow"),
+        "zoom_pulse": ("speed_blur_lines", "zoom_pulse"),
+        "orbit_right": ("action", "orbit_right"),
+        "parallax_zoom": ("atmospheric_grade", "parallax_zoom"),
+        "ken_burns_slow": ("cinematic_grade", "ken_burns_slow"),
+        "subtle_drift": ("cinematic_grade", "subtle_drift"),
+        "portrait_enhance": ("portrait_enhance", "push_in_slow"),
+        "atmospheric_grade": ("atmospheric_grade", "ken_burns_slow"),
+        "cinematic_grade": ("cinematic_grade", "subtle_drift"),
+        "impact_flash_combo": ("impact_flash_combo", "camera_slam"),
+        "energy_aura": ("energy_aura", "handheld_shake"),
+    }
+
     def __init__(self) -> None:
         self.last_render_meta: dict[str, Any] = {
             "frame_engine_segments": 0,
@@ -1017,8 +1172,18 @@ class UnifiedRenderEngine:
             "timed_out": False,
             "segments_requested": 0,
             "segments_rendered": 0,
+            "taste_filtered_segments": 0,
+            "frame_engine_failures": 0,
+            "frame_engine_disabled": False,
+            "frame_engine_skipped_long_segments": 0,
+            "cinematic_director_segments": 0,
+            "narrative_director_connected": False,
+            "director_explainability_log": [],
+            "director_narrative_summary": [],
         }
         self.deadline_ts = time.time() + BRAIN_MAX_RUNTIME_SEC
+        self._frame_engine_failures = 0
+        self._frame_engine_disabled = False
 
     def render(
         self,
@@ -1076,6 +1241,8 @@ class UnifiedRenderEngine:
         beat_map = dict(beat_map)
         beat_map["fps"] = info.get("fps", 30.0)
         director = MomentEffectDirector(mood, beat_map, style)
+        cinematic_timeline = self._build_cinematic_timeline(assignments, beat_map, style)
+        taste_filter = self._make_taste_filter(style)
         previous_segment: Path | None = None
         previous_scene: SceneRead | None = None
         for idx, (scene, section) in enumerate(assignments):
@@ -1095,6 +1262,8 @@ class UnifiedRenderEngine:
             heavy = restraint.should_fire_heavy(scene, beat_energy, section.type, idx, is_peak)
             effect_intensity = restraint.get_effect_intensity(scene, intensity, section.type, heavy)
             plan = director.plan_segment(scene, section, effect_intensity, heavy, idx, beat_energy)
+            director_shot = cinematic_timeline[idx] if idx < len(cinematic_timeline) else None
+            plan = self._apply_taste_filter(plan, taste_filter, scene, section, beat_energy, idx, director_shot)
             vf = taste.build_filter_chain(scene, section, effect_intensity, style, info)
             speed = 1.0
             if scene.scene_type == "impact" and heavy and bool(style.get("speed_ramp", False)):
@@ -1104,6 +1273,12 @@ class UnifiedRenderEngine:
             segment_path = tmp / f"seg_{idx:04d}.mp4"
             transition_sec = 0.08 if heavy else 0.045
             ok = False
+            cxx_safe_segment = (scene.end - scene.start) <= BRAIN_CPP_MAX_SEGMENT_SEC
+            if plan.use_frame_engine and self._frame_engine_disabled:
+                plan.use_frame_engine = False
+            if plan.use_frame_engine and not cxx_safe_segment:
+                plan.use_frame_engine = False
+                self.last_render_meta["frame_engine_skipped_long_segments"] += 1
             if plan.use_frame_engine:
                 raw_path = tmp / f"raw_{idx:04d}.mp4"
                 if self._cut_source_segment(src, raw_path, scene.start, scene.end, speed, info):
@@ -1161,11 +1336,180 @@ class UnifiedRenderEngine:
                 self.last_render_meta["segments_rendered"] += 1
                 previous_segment = segment_path
                 previous_scene = scene
+            elif not ok:
+                _log(f"segment {idx:04d} render failed; skipping", "WARN")
             if heavy and is_peak and bool(style.get("flash", True)):
                 flash_path = tmp / f"flash_{idx:04d}.mp4"
                 if self._make_flash(flash_path, mood, info):
                     segments.append(flash_path)
         return segments
+
+    def _make_taste_filter(self, style: dict[str, Any]) -> Any:
+        if TasteFilter is None:
+            return None
+        seed = style.get("variation_seed", style.get("seed", 42))
+        try:
+            seed = int(seed)
+        except Exception:
+            seed = 42
+        try:
+            return TasteFilter(seed=seed, personality_weights=style.get("effect_weights") or {})
+        except Exception as exc:
+            _log(f"taste filter unavailable: {exc}", "WARN")
+            return None
+
+    def _build_cinematic_timeline(
+        self,
+        assignments: list[tuple[SceneRead, NarrativeSection]],
+        beat_map: dict[str, Any],
+        style: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if CinematicDirector is None or DirectorShotFeatures is None:
+            return []
+        shots = []
+        for scene, section in assignments:
+            composition = 0.5
+            if scene.has_face:
+                centered = 1.0 - min(1.0, math.hypot(scene.face_pos_x - 0.5, scene.face_pos_y - 0.42) / 0.58)
+                thirds_x = min(abs(scene.face_pos_x - (1.0 / 3.0)), abs(scene.face_pos_x - (2.0 / 3.0)))
+                thirds = 1.0 - min(1.0, thirds_x / 0.34)
+                composition = float(np.clip((centered * 0.62) + (thirds * 0.38), 0.0, 1.0))
+            shot = DirectorShotFeatures(
+                start=scene.start,
+                end=scene.end,
+                motion=float(np.clip(scene.motion, 0.0, 1.0)),
+                brightness=float(np.clip(scene.brightness, 0.0, 1.0)),
+                audio_energy=float(np.clip(section.energy, 0.0, 1.0)),
+                on_beat=False,
+                is_drop=bool(section.type == "drop" or scene.is_climax),
+                has_faces=bool(scene.has_face),
+                has_speech=scene.scene_type == "dialogue",
+                face_count=1 if scene.has_face else 0,
+                subject_confidence=float(np.clip(scene.face_size + scene.edit_value * 0.5, 0.0, 1.0)),
+                composition_score=round(composition, 4),
+                visual_importance=float(np.clip(scene.edit_value, 0.0, 1.0)),
+                shot_type="close_up" if scene.face_size >= 0.09 else "medium" if scene.has_face else "wide",
+            )
+            shots.append(shot)
+        try:
+            bpm = float(beat_map.get("bpm", 130.0) or 130.0)
+            seed = int(style.get("variation_seed", style.get("seed", 42)) or 42)
+            director = CinematicDirector(seed=seed, personality_weights=style.get("effect_weights") or {})
+            if hasattr(director, "run"):
+                timeline = director.run(shots, bpm)
+            else:
+                timeline = director.plan(shots, bpm)
+            self.last_render_meta["cinematic_director_segments"] = len(timeline)
+            self.last_render_meta["narrative_director_connected"] = True
+            self.last_render_meta["director_explainability_log"] = self._compact_explainability(timeline)
+            self.last_render_meta["director_narrative_summary"] = self._compact_narrative_summary(timeline)
+            return timeline
+        except Exception as exc:
+            _log(f"cinematic director planning unavailable: {exc}", "WARN")
+            return []
+
+    @staticmethod
+    def _compact_explainability(timeline: list[dict[str, Any]], limit: int = 40) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for shot in timeline:
+            for item in shot.get("explainability_log") or []:
+                entries.append(
+                    {
+                        "start": shot.get("start"),
+                        "end": shot.get("end"),
+                        "intent": shot.get("intent"),
+                        "effect": item.get("effect"),
+                        "strength": item.get("strength"),
+                        "reason": item.get("reason", []),
+                    }
+                )
+                if len(entries) >= limit:
+                    return entries
+        return entries
+
+    @staticmethod
+    def _compact_narrative_summary(timeline: list[dict[str, Any]], limit: int = 40) -> list[dict[str, Any]]:
+        summary: list[dict[str, Any]] = []
+        for shot in timeline[:limit]:
+            narrative = shot.get("narrative") or {}
+            decision = narrative.get("directing_decision") or {}
+            act = narrative.get("act") or {}
+            summary.append(
+                {
+                    "start": shot.get("start"),
+                    "end": shot.get("end"),
+                    "intent": shot.get("intent"),
+                    "act": act.get("act_type"),
+                    "relationship": narrative.get("relationship"),
+                    "directing": {
+                        "save_best_moment": bool(decision.get("save_best_moment", False)),
+                        "delay_climax": bool(decision.get("delay_climax", False)),
+                        "build_suspense": bool(decision.get("build_suspense", False)),
+                        "hold_shot": bool(decision.get("hold_shot", False)),
+                        "callback_motif": decision.get("callback_motif"),
+                        "reason": decision.get("reason", ""),
+                    },
+                }
+            )
+        return summary
+
+    def _taste_intent(self, scene: SceneRead, section: NarrativeSection, beat_energy: float) -> str:
+        if scene.scene_type == "dialogue":
+            return "dialogue"
+        if section.type == "buildup":
+            return "build-up"
+        if section.type in {"drop", "chorus"} or scene.scene_type == "impact" or beat_energy > 0.72:
+            return "impact"
+        if section.type in {"break", "intro", "outro"} or scene.scene_type in {"quiet", "scenery"}:
+            return "calm"
+        return "transition"
+
+    def _apply_taste_filter(
+        self,
+        plan: DirectedEffectPlan,
+        taste_filter: Any,
+        scene: SceneRead,
+        section: NarrativeSection,
+        beat_energy: float,
+        idx: int,
+        director_shot: dict[str, Any] | None = None,
+    ) -> DirectedEffectPlan:
+        if taste_filter is None:
+            return plan
+        try:
+            shot = dict(director_shot or {})
+            shot.update(
+                {
+                    "start": scene.start,
+                    "end": scene.end,
+                    "energy": float(np.clip(shot.get("energy", beat_energy), 0.0, 1.0)),
+                    "is_drop": bool(plan.is_drop or section.type == "drop" or shot.get("is_drop", False)),
+                    "has_speech": scene.scene_type == "dialogue" or bool(shot.get("has_speech", False)),
+                    "transition": str(shot.get("transition") or plan.transition),
+                    "effects": [{"name": plan.effect, "strength": plan.effect_intensity}],
+                }
+            )
+            if "intent" not in shot:
+                shot["intent"] = self._taste_intent(scene, section, beat_energy)
+            filtered = taste_filter.filter_timeline([shot], [shot["energy"]])[0]
+            effects = filtered.get("effects") or []
+            if effects:
+                picked = max(effects, key=lambda e: float(e.get("strength", 0.0) or 0.0))
+                name = str(picked.get("name") or plan.effect)
+                strength = float(picked.get("strength", plan.effect_intensity) or plan.effect_intensity)
+                mapped_effect, mapped_animation = self.TASTE_EFFECT_MAP.get(name, (name, plan.animation))
+                plan.effect = mapped_effect
+                if mapped_animation:
+                    plan.animation = mapped_animation
+                plan.effect_intensity = float(np.clip(strength, 0.05, 1.0))
+                plan.animation_intensity = float(np.clip(0.20 + plan.effect_intensity * 0.70, 0.15, 1.0))
+            transition = str(filtered.get("transition") or plan.transition)
+            if transition:
+                plan.transition = transition
+            self.last_render_meta["taste_filtered_segments"] += 1
+        except Exception as exc:
+            _log(f"taste filter failed for segment {idx}: {exc}", "WARN")
+        return plan
 
     def _cut_source_segment(
         self,
@@ -1243,6 +1587,11 @@ class UnifiedRenderEngine:
         ]
         ok, err = _run(cmd, timeout=BRAIN_FRAME_ENGINE_TIMEOUT_SEC)
         if not ok:
+            self._frame_engine_failures += 1
+            self.last_render_meta["frame_engine_failures"] = self._frame_engine_failures
+            if self._frame_engine_failures >= BRAIN_CPP_FAILURE_LIMIT:
+                self._frame_engine_disabled = True
+                self.last_render_meta["frame_engine_disabled"] = True
             _log(f"frame engine segment failed: {err[:180]}", "WARN")
         return ok and out.exists() and out.stat().st_size > 0
 
@@ -1375,6 +1724,8 @@ class UnifiedRenderEngine:
                 f"{duration:.4f}",
                 "-vf",
                 filter_str,
+                "-r",
+                f"{float(_fit_render_info(_probe(src)).get('fps', 30.0)):.3f}",
                 "-an",
                 "-c:v",
                 "libx264",
@@ -1400,8 +1751,16 @@ class UnifiedRenderEngine:
                 "-t",
                 f"{duration:.4f}",
                 "-an",
+                "-r",
+                f"{float(_fit_render_info(_probe(src)).get('fps', 30.0)):.3f}",
                 "-c:v",
-                "copy",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
                 str(out),
             ]
         ok, err = _run(cmd, timeout=BRAIN_SEGMENT_TIMEOUT_SEC)
@@ -1580,8 +1939,12 @@ class UnifiedRenderEngine:
         except Exception:
             pass
         if not ok:
-            _log(f"concat failed: {err[:200]}", "WARN")
-        return ok and output.exists() and output.stat().st_size > 0
+            _log(f"concat failed (music={bool(has_music)}, segs={len(segments)}, err={err[:200]})", "WARN")
+            return False
+        if not (output.exists() and output.stat().st_size > 0):
+            _log(f"concat output invalid or missing: {output}", "WARN")
+            return False
+        return True
 
 
 class ArchiveEliteBrain:
@@ -1658,6 +2021,18 @@ class ArchiveEliteBrain:
             taste=taste,
         )
         elapsed = time.time() - started
+        meta = renderer.last_render_meta
+        _log(
+            f"brain render complete: ok={ok}, segments_rendered={meta.get('segments_rendered')}/{meta.get('segments_requested')}, "
+            f"timed_out={meta.get('timed_out')}, elapsed={elapsed:.1f}s",
+            "ARCHIVE",
+        )
+        if not ok and meta.get("timed_out"):
+            _log(
+                f"render timed out after {meta.get('segments_rendered')} segments; "
+                "check FFmpeg input files and ensure they exist at specified seek positions",
+                "WARN",
+            )
         return {
             "ok": ok,
             "duration": duration,
@@ -1668,7 +2043,7 @@ class ArchiveEliteBrain:
             "sections": [section.type for section in arc.sections],
             "scene_types": [scene.scene_type for scene in scenes[:10]],
             "drops": beat_map.get("drop_times", []),
-            "render_meta": renderer.last_render_meta,
+            "render_meta": meta,
         }
 
     def _build_cut_points(

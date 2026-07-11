@@ -263,7 +263,7 @@ export default function App() {
     form.append("video", file);
     form.append("render_id", renderId);
 
-    setStatus("ARCHIVE backend: analyzing audio + rendering with librosa/moviepy...");
+    setStatus("ARCHIVE backend: analyzing audio + rendering with PyAV/FFmpeg...");
     setIsRendering(true);
     setEtaWindow(estimateRenderWindow(prompt.trim(), videoMeta));
     setBackendProgress({

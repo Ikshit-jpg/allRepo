@@ -303,7 +303,7 @@ class FFmpegEngine:
             f"{dur:.3f}",
             job.output_path,
         ]
-        return self._run(args, timeout=120)
+        return self._run(args, timeout=400)
 
     def assemble_timeline(self, graph: TimelineGraph, crf: int = 16, preset: str = "veryfast") -> tuple[bool, str]:
         clips = [clip.render_job.output_path for clip in graph.clips]
@@ -495,7 +495,7 @@ class FFmpegEngine:
             str(self.threads),
             job.output_path,
         ]
-        return self._run(args, timeout=120)
+        return self._run(args, timeout=400)
 
     def post_process(self, input_path: str, output_path: str, mood: str = "hype") -> tuple[bool, str]:
         if not os.path.exists(input_path):

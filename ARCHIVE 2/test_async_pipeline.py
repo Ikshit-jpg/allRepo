@@ -62,7 +62,7 @@ def test_async_pipeline():
                     'prompt': 'dramatic anime cinematic dark phonk with all effects intense'
                 }
                 try:
-                    resp = requests.post(f"{BASE_URL}/api/render", files=files, data=data, timeout=120)
+                    resp = requests.post(f"{BASE_URL}/api/render", files=files, data=data, timeout=400)
                     print(f"\n   [Background] Render endpoint responded: {resp.status_code}")
                     if resp.status_code in (200, 202):
                         result = resp.json()

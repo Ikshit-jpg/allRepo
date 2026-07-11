@@ -357,7 +357,7 @@
       form.append("prompt", prompt.trim());
       form.append("video", file);
 
-      setStatus("ARCHIVE backend: analyzing audio + rendering with librosa/moviepy...");
+      setStatus("ARCHIVE backend: analyzing audio + rendering with PyAV/FFmpeg...");
       setIsRendering(true);
       setRenderUrl("");
       setDownloadUrl("");

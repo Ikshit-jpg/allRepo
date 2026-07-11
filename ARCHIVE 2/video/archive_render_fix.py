@@ -88,7 +88,7 @@ RENDER_TIMEOUT_SEC = 180
 STAGE_TIMEOUT_SEC = 90
 
 # Subprocess timeout — individual FFmpeg / engine call max time
-SUBPROCESS_TIMEOUT_SEC = 120
+SUBPROCESS_TIMEOUT_SEC = 400
 
 # If True, skip all expensive effects and just do grade+vignette
 # Automatically enabled if fast render fails

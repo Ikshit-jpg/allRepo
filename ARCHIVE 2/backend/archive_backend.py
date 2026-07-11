@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import builtins
 import hmac
 import io
 import json
@@ -31,6 +32,10 @@ from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 try:
     from flask_limiter import Limiter
     from flask_limiter.util import get_remote_address
@@ -42,7 +47,6 @@ except ImportError:
 
 import librosa
 import numpy as np
-from moviepy.editor import AudioFileClip, ColorClip, VideoClip, VideoFileClip, concatenate_videoclips, vfx
 from video.cache import file_cache_signature, load_json_cache, prune_files, write_json_cache
 from video.audio_features import analyze_audio_features
 from brain.editor_personality import apply_personality_to_style, infer_editor_personality
@@ -52,6 +56,13 @@ from brain.scene_analysis import scene_analysis_config
 from video.smart_cutting import annotate_cut_scores
 from video.transitions import transition_name_for_mood
 from brain.visual_understanding import enrich_segment_rows, transition_hint_from_row
+try:
+    from archive_pyav_renderer import render_video_with_pyav
+
+    PYAV_RENDERER_AVAILABLE = True
+except Exception:
+    render_video_with_pyav = None
+    PYAV_RENDERER_AVAILABLE = False
 try:
     from archive_engine import FFmpegEngine as PermanentFFmpegEngine
 
@@ -180,16 +191,19 @@ except Exception:
     ort = None
     ONNXRUNTIME_AVAILABLE = False
 
-try:
-    from moviepy.audio.fx.all import audio_loop as _moviepy_audio_loop_fx  # moviepy 1.x
-except Exception:
-    try:
-        from moviepy.audio.fx.AudioLoop import AudioLoop  # moviepy 2.x  # type: ignore
+MOVIEPY_DISABLED = True
+_moviepy_audio_loop_fx = None
 
-        def _moviepy_audio_loop_fx(clip: Any, duration: float) -> Any:
-            return clip.with_effects([AudioLoop(duration=duration)])
-    except Exception:
-        _moviepy_audio_loop_fx = None
+if MOVIEPY_DISABLED and not getattr(builtins, "_archive_moviepy_disabled", False):
+    _ARCHIVE_ORIGINAL_IMPORT = builtins.__import__
+
+    def _archive_block_moviepy_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "moviepy" or name.startswith("moviepy."):
+            raise ImportError("MoviePy is disabled in ARCHIVE; use PyAV/FFmpeg renderers.")
+        return _ARCHIVE_ORIGINAL_IMPORT(name, *args, **kwargs)
+
+    builtins.__import__ = _archive_block_moviepy_import
+    builtins._archive_moviepy_disabled = True
 
 sys.dont_write_bytecode = True
 
@@ -260,8 +274,11 @@ def _bootstrap_bundled_ffmpeg() -> str:
 
 
 BOOTSTRAPPED_FFMPEG_EXE = _bootstrap_bundled_ffmpeg()
-ARCHIVE_BRAIN_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TIMEOUT_SEC", "420")))
+ARCHIVE_BRAIN_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TIMEOUT_SEC", "1740")))
 ARCHIVE_EXTERNAL_EFFECT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_EXTERNAL_EFFECT_TIMEOUT_SEC", "90")))
+ARCHIVE_SPEED_MODE = os.getenv("ARCHIVE_SPEED_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+ARCHIVE_DEFAULT_FAST_RENDER = os.getenv("ARCHIVE_DEFAULT_FAST_RENDER", "0").strip().lower() in {"1", "true", "yes", "on"}
+ARCHIVE_DEFAULT_BRAIN_RENDER = os.getenv("ARCHIVE_DEFAULT_BRAIN_RENDER", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 # --- Upload validation: 500 MB hard ceiling ---
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("ARCHIVE_MAX_UPLOAD_MB", "500")) * 1024 * 1024
@@ -302,7 +319,7 @@ def _setup_logging() -> None:
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
     # Quiet noisy libraries.
-    for lib in ("werkzeug", "moviepy", "imageio", "urllib3", "numba"):
+    for lib in ("werkzeug", "imageio", "urllib3", "numba"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
 _setup_logging()
@@ -418,7 +435,9 @@ def _collect_startup_diagnostics() -> dict[str, Any]:
             "werkzeug": True,
             "numpy": True,
             "opencv": True,
-            "moviepy": True,
+            "moviepy": False,
+            "moviepy_disabled": MOVIEPY_DISABLED,
+            "pyav_renderer": PYAV_RENDERER_AVAILABLE,
             "librosa": True,
             "music_upgrade": MUSIC_UPGRADE_AVAILABLE,
             "effects_engine": EFFECTS_ENGINE_AVAILABLE,
@@ -510,6 +529,31 @@ def _get_render_status(render_id: str) -> dict[str, Any] | None:
         return dict(payload)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CANCELLATION TRACKING
+# ─────────────────────────────────────────────────────────────────────────────
+_CANCELLED_RENDERS_LOCK = Lock()
+_CANCELLED_RENDERS: set[str] = set()
+
+
+def _is_render_cancelled(render_id: str) -> bool:
+    """Check if a render has been cancelled by the user."""
+    with _CANCELLED_RENDERS_LOCK:
+        return render_id in _CANCELLED_RENDERS
+
+
+def _mark_render_cancelled(render_id: str) -> None:
+    """Mark a render as cancelled."""
+    with _CANCELLED_RENDERS_LOCK:
+        _CANCELLED_RENDERS.add(render_id)
+
+
+def _clear_cancelled_render(render_id: str) -> None:
+    """Remove a render from cancelled set (cleanup after completion)."""
+    with _CANCELLED_RENDERS_LOCK:
+        _CANCELLED_RENDERS.discard(render_id)
+
+
 try:
     cv2.setUseOptimized(True)
     cv2.setNumThreads(max(1, min(8, os.cpu_count() or 4)))
@@ -524,21 +568,7 @@ def _audio_loop_clip(clip: Any, duration: float) -> Any:
     target = float(max(0.0, duration or 0.0))
     if clip is None or target <= 0:
         return clip
-    if _moviepy_audio_loop_fx is not None:
-        return _moviepy_audio_loop_fx(clip, duration=target)
-    base_dur = float(getattr(clip, "duration", 0.0) or 0.0)
-    if base_dur <= 0:
-        return clip
-    loops = max(1, int(math.ceil(target / base_dur)))
-    try:
-        from moviepy.editor import concatenate_audioclips
-
-        out = concatenate_audioclips([clip] * loops)
-        if float(getattr(out, "duration", 0.0) or 0.0) > target:
-            out = out.subclip(0, target)
-        return out
-    except Exception:
-        return clip
+    raise RuntimeError("MoviePy audio looping is disabled; use FFmpeg/PyAV audio handling.")
 
 MOOD_TO_QUERY = {
     "hype": "aggressive phonk drift",
@@ -2111,6 +2141,97 @@ def _max_render_pixels(style: dict[str, Any], *, fallback_pixels: int = 3840 * 2
         # Keep fast mode lighter but still above 1080p.
         return 2560 * 1440
     return fallback_pixels
+
+
+def _apply_performance_defaults(prompt: str, style_profile: dict[str, Any]) -> dict[str, Any]:
+    """
+    Prefer the best edit path by default: brain/C++ effects on selected hero moments,
+    while keeping the fast/global renderer out of effect-heavy renders.
+    """
+    profile = dict(style_profile or {})
+    if not ARCHIVE_SPEED_MODE:
+        profile["brain_render"] = ARCHIVE_DEFAULT_BRAIN_RENDER
+        profile["fast_render"] = False
+        profile["disable_fast_renderer"] = True
+        profile["quality_priority"] = True
+        profile["advanced_compositor"] = True
+        profile["cpp_render_clip"] = True
+        profile["selective_beats"] = True
+        profile["all_beats"] = False
+        profile["heavy_effects_engine"] = True
+        if not bool(profile.get("simple_mode", False)):
+            profile["intensity"] = max(2, int(profile.get("intensity", 2) or 2))
+        return profile
+
+    text = (prompt or "").lower()
+    heavy_requested = any(
+        token in text
+        for token in (
+            "all effects",
+            "everything",
+            "max effects",
+            "maximum quality",
+            "highest quality",
+            "quality priority",
+            "pro pack",
+            "pro edit",
+            "brain render",
+            "elite brain",
+            "master brain",
+            "4k",
+        )
+    )
+    fast_requested = any(
+        token in text
+        for token in (
+            "fast render",
+            "quick render",
+            "minimum time",
+            "low time",
+            "faster",
+            "speed mode",
+        )
+    )
+
+    if ARCHIVE_DEFAULT_FAST_RENDER or fast_requested:
+        profile["fast_render"] = True
+        profile["disable_fast_renderer"] = False
+
+    if not heavy_requested:
+        explicit_effects = set(profile.get("explicit_effects", []) or [])
+        if int(profile.get("intensity", 2) or 2) > 2 and not any(
+            token in text for token in ("intense", "insane", "hard", "aggressive", "maximum", "all effects")
+        ):
+            profile["intensity"] = 2
+        for key in (
+            "overlap_transitions",
+            "mask_transition",
+            "loop_clips",
+            "loop_ending",
+            "particles",
+            "energy_aura",
+            "turbulent",
+            "turbulent_displace",
+            "blend_overlay",
+            "mask_roto",
+            "chroma_key",
+            "difference_matte",
+            "object_inpaint",
+            "fire_lines",
+            "boomerang",
+            "pro_edit_pack",
+        ):
+            if key not in explicit_effects:
+                profile[key] = False
+        profile["quality_priority"] = False
+        profile["brain_render"] = ARCHIVE_DEFAULT_BRAIN_RENDER
+        profile["heavy_effects_engine"] = False
+    else:
+        profile["brain_render"] = ARCHIVE_DEFAULT_BRAIN_RENDER or any(
+            token in text for token in ("brain render", "elite brain", "master brain")
+        )
+
+    return profile
 
 
 def _enforce_high_energy_style(prompt: str, mood: str, style_profile: dict[str, Any]) -> dict[str, Any]:
@@ -4033,6 +4154,78 @@ def generate_beat_markers(video_duration_sec: float, bpm: int) -> list[float]:
     return [round(i * beat_interval, 3) for i in range(total_beats + 1)]
 
 
+def probe_video_metadata(video_path: Path) -> dict[str, Any]:
+    ffprobe_cmd = shutil.which("ffprobe")
+    if ffprobe_cmd:
+        try:
+            proc = run_subprocess(
+                [
+                    ffprobe_cmd,
+                    "-v",
+                    "error",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-show_format",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if proc.ok:
+                data = json.loads(proc.stdout or "{}")
+                streams = data.get("streams", [])
+                video_stream = next((s for s in streams if s.get("codec_type") == "video"), {})
+                fps_raw = str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "30/1")
+                try:
+                    num, den = fps_raw.split("/", 1)
+                    fps = float(num) / max(1.0, float(den))
+                except Exception:
+                    fps = 30.0
+                duration = float(data.get("format", {}).get("duration") or video_stream.get("duration") or 0.0)
+                return {
+                    "duration": max(0.0, duration),
+                    "fps": max(1.0, fps),
+                    "width": int(video_stream.get("width") or 0),
+                    "height": int(video_stream.get("height") or 0),
+                    "has_audio": any(s.get("codec_type") == "audio" for s in streams),
+                }
+        except Exception:
+            pass
+    return {"duration": 0.0, "fps": 30.0, "width": 0, "height": 0, "has_audio": False}
+
+
+def extract_audio_for_analysis(video_path: Path, output_path: Path, duration_sec: float) -> bool:
+    ffmpeg_cmd = shutil.which("ffmpeg")
+    if not ffmpeg_cmd:
+        return False
+    cmd = [
+        ffmpeg_cmd,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{max(0.1, float(duration_sec or BEAT_ANALYSIS_MAX_SEC)):.3f}",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "22050",
+        "-c:a",
+        "pcm_s16le",
+        str(output_path),
+    ]
+    try:
+        proc = run_subprocess(cmd, capture_output=True, text=True, timeout=90)
+        return proc.ok and output_path.exists() and output_path.stat().st_size > 0
+    except Exception:
+        return False
+
+
 def is_allowed_video(filename: str) -> bool:
     ext = Path(filename).suffix.lower()
     return ext in ALLOWED_VIDEO_EXTENSIONS
@@ -4042,26 +4235,22 @@ def detect_beats_with_librosa(video_path: Path, mood: str) -> tuple[int, float, 
     warnings: list[str] = []
     fallback_bpm = MOOD_TO_BPM.get(mood, 130)
 
-    with VideoFileClip(str(video_path)) as clip:
-        duration = float(clip.duration or 0.0)
-        if not clip.audio:
-            warnings.append("Video has no audio; using fallback BPM.")
-            return fallback_bpm, duration, generate_beat_markers(duration, fallback_bpm), warnings
+    meta = probe_video_metadata(video_path)
+    duration = float(meta.get("duration") or 0.0)
+    if not meta.get("has_audio"):
+        warnings.append("Video has no audio; using fallback BPM.")
+        return fallback_bpm, duration, generate_beat_markers(duration, fallback_bpm), warnings
 
-        analysis_window = min(duration if duration > 0 else 0.0, BEAT_ANALYSIS_MAX_SEC)
-        if duration > BEAT_ANALYSIS_MAX_SEC:
-            warnings.append(
-                f"Fast beat mode enabled: analyzing first {int(BEAT_ANALYSIS_MAX_SEC)}s then extending BPM across timeline."
-            )
-
-        temp_audio_path = UPLOAD_DIR / f"audio_{uuid.uuid4().hex}.wav"
-        clip.audio.write_audiofile(
-            str(temp_audio_path),
-            fps=22050,
-            nbytes=2,
-            codec="pcm_s16le",
-            logger="bar",
+    analysis_window = min(duration if duration > 0 else 0.0, BEAT_ANALYSIS_MAX_SEC)
+    if duration > BEAT_ANALYSIS_MAX_SEC:
+        warnings.append(
+            f"Fast beat mode enabled: analyzing first {int(BEAT_ANALYSIS_MAX_SEC)}s then extending BPM across timeline."
         )
+
+    temp_audio_path = UPLOAD_DIR / f"audio_{uuid.uuid4().hex}.wav"
+    if not extract_audio_for_analysis(video_path, temp_audio_path, analysis_window):
+        warnings.append("FFmpeg audio extraction failed; using fallback BPM.")
+        return fallback_bpm, duration, generate_beat_markers(duration, fallback_bpm), warnings
 
     try:
         y, sr = _fast_audio_load(temp_audio_path, duration_sec=analysis_window if analysis_window > 0 else 0.0)
@@ -6981,9 +7170,7 @@ def apply_strong_effects_to_segment(
     effect_hints: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Drop-in replacement for _apply_mood_effects() with VISIBLE parameters."""
-    try:
-        from moviepy.editor import vfx as _vfx
-    except ImportError:
+    if MOVIEPY_DISABLED:
         return segment, {}
 
     intel     = intelligence or {}
@@ -7005,21 +7192,38 @@ def apply_strong_effects_to_segment(
 
     wants = lambda k: bool(style.get(k, False)) or bool(hints.get(f"{k}_applied", False))
 
-    auto_shake   = intensity >= 3 and mood in ("hype", "dark", "dramatic") and is_impact
-    auto_zoom    = intensity >= 2 and is_impact and impact_rank > 0.55
-    auto_glow    = intensity >= 2 and not style.get("no_color_grade", False)
-    auto_grain   = intensity >= 2
-    auto_vignette = intensity >= 2 and not style.get("no_color_grade", False)
-    auto_grade   = not style.get("no_color_grade", False)
-    auto_flash   = intensity >= 3 and is_impact and scene_change > 0.22
-    auto_glitch  = mood in ("dark",) and intensity >= 2 and is_impact
-    auto_fire    = style.get("fire_lines", False) or style.get("energy_aura", False)
+    # REDUCED AUTO-EFFECTS: Brain render already decides effects per-segment
+    # Only apply auto-effects if explicitly requested via style
+    brain_render_used = bool(hints.get("brain_render_used", False))
+    
+    # If brain render was used, trust its decisions - don't auto-apply aggressive effects
+    if brain_render_used:
+        auto_shake   = False  # Brain render handles animations
+        auto_zoom    = False  # Brain render handles zoom
+        auto_glitch  = False  # Brain render handles glitch
+        auto_flash   = False  # Brain render handles flash
+        auto_fire    = False  # Brain render handles fire/aura
+        auto_glow    = intensity >= 2 and not style.get("no_color_grade", False)  # Subtle global glow OK
+        auto_grain   = intensity >= 2  # Subtle grain OK
+        auto_vignette = intensity >= 2 and not style.get("no_color_grade", False)  # Subtle vignette OK
+        auto_grade   = not style.get("no_color_grade", False)  # Always apply subtle grade
+    else:
+        # Fallback pipeline: more conservative auto-effects
+        auto_shake   = intensity >= 3 and mood in ("hype", "dark", "dramatic") and is_impact and index % 3 == 0
+        auto_zoom    = intensity >= 2 and is_impact and impact_rank > 0.55 and index % 2 == 0
+        auto_glow    = intensity >= 2 and not style.get("no_color_grade", False)
+        auto_grain   = intensity >= 2
+        auto_vignette = intensity >= 2 and not style.get("no_color_grade", False)
+        auto_grade   = not style.get("no_color_grade", False)
+        auto_flash   = intensity >= 3 and is_impact and scene_change > 0.22 and index % 4 == 0  # Rare
+        auto_glitch  = mood == "dark" and intensity >= 3 and is_impact and index % 5 == 0  # Very rare
+        auto_fire    = style.get("fire_lines", False) or style.get("energy_aura", False)
 
     do_grade      = auto_grade  or wants("color_grade")
     do_glow       = auto_glow   or wants("glow")
     do_fire       = auto_fire   or wants("fire_lines") or wants("energy_aura")
     do_glitch     = auto_glitch or wants("glitch")
-    do_chromatic  = wants("chroma_pulse") or wants("glitch")
+    do_chromatic  = wants("chroma_pulse") or (auto_glitch and wants("glitch"))  # Only with explicit glitch
     do_shake      = auto_shake  or wants("shake")
     do_zoom       = auto_zoom   or wants("zoom")
     do_speed_lines = wants("speed_lines") or wants("turbulent_displace")
@@ -7155,7 +7359,7 @@ def apply_strong_effects_to_segment(
     return segment, applied
 
 
-def render_video_with_moviepy(
+def render_video_with_pyav_pipeline(
     video_path: Path,
     output_path: Path,
     beat_markers: list[float],
@@ -7168,35 +7372,24 @@ def render_video_with_moviepy(
     audio_features: dict[str, Any] | None = None,
 ) -> float:
     style = build_style_profile(prompt_text, mood)
+    style = _enforce_high_energy_style(prompt_text, mood, style)
+    style = _apply_performance_defaults(prompt_text, style)
     intensity = int(style.get("intensity", 1))
-    if bool(style.get("pro_edit_pack", False)) and (not bool(style.get("simple_mode", False))):
-        if not bool(style.get("overlap_transitions", False)):
-            style["overlap_transitions"] = True
-        if not bool(style.get("mask_transition", False)) and (intensity >= 2 or mood in {"hype", "dramatic"}):
-            style["mask_transition"] = True
-    wants_mask_transition = bool(style.get("mask_transition", False))
-    wants_overlap_transitions = bool(style.get("overlap_transitions", False)) or wants_mask_transition
-    selective_beats = bool(style.get("selective_beats", True)) and (not bool(style.get("all_beats", False)))
-    all_beats = bool(style.get("all_beats", False))
-    fast_render = bool(style.get("fast_render", False))
     disable_fast_renderer = bool(style.get("disable_fast_renderer", False))
-    prefer_fast_renderer = not disable_fast_renderer
-    quality_priority = bool(style.get("quality_priority", False))
     ffmpeg_available = shutil.which("ffmpeg") is not None
-    offload_to_ffmpeg = ffmpeg_available and any(bool(style.get(k, False)) for k in FFMPEG_OFFLOAD_EFFECT_KEYS)
-    ffmpeg_post_filter = _build_ffmpeg_post_filter(style, mood, int(style.get("intensity", 1))) if offload_to_ffmpeg else ""
-    if not ffmpeg_post_filter:
-        offload_to_ffmpeg = False
+    style_compatible = archive_fast_render_is_compatible(style, bool(music_path)) if archive_fast_render_is_compatible else False
     can_try_archive_fast = bool(
         FAST_RENDERER_AVAILABLE
         and run_archive_fast_render
         and archive_fast_render_is_compatible
         and ffmpeg_available
-        and prefer_fast_renderer
-        and archive_fast_render_is_compatible(style, bool(music_path))
+        and not disable_fast_renderer
+        and style_compatible
     )
+
     if can_try_archive_fast:
         try:
+            app.logger.info("[ARCHIVE] Attempting FFmpeg fast renderer for %s", output_path.name)
             fast_duration = float(
                 run_archive_fast_render(
                     video_path=video_path,
@@ -7215,8 +7408,50 @@ def render_video_with_moviepy(
             if fast_duration > 0 and output_path.exists() and output_path.stat().st_size > 0:
                 app.logger.info("[ARCHIVE] Fast FFmpeg renderer succeeded for %s", output_path.name)
                 return fast_duration
+            app.logger.warning("[ARCHIVE] FFmpeg renderer returned invalid output; switching to PyAV")
         except Exception as fast_exc:
-            app.logger.warning("Fast FFmpeg renderer failed, falling back to MoviePy: %s", fast_exc)
+            app.logger.warning("Fast FFmpeg renderer failed; switching to PyAV: %s", fast_exc, exc_info=True)
+    else:
+        app.logger.info("[ARCHIVE] FFmpeg fast renderer unavailable or incompatible; using PyAV")
+
+    if PYAV_RENDERER_AVAILABLE and render_video_with_pyav:
+        pyav_duration = float(
+            render_video_with_pyav(
+                video_path=str(video_path),
+                output_path=str(output_path),
+                beat_markers=beat_markers,
+                mood=mood,
+                music_path=str(music_path) if music_path else None,
+                prompt_text=prompt_text,
+                variation_seed=variation_seed,
+                drop_times=drop_times,
+                visual_vibe=visual_vibe,
+                audio_features=audio_features,
+                style_profile=style,
+            )
+            or 0.0
+        )
+        if pyav_duration > 0 and output_path.exists() and output_path.stat().st_size > 0:
+            app.logger.info("[ARCHIVE] PyAV renderer succeeded for %s", output_path.name)
+            return pyav_duration
+        app.logger.warning("[ARCHIVE] PyAV renderer returned invalid output; using FFmpeg safe fallback")
+
+    return render_video_safe_fallback(video_path, output_path, music_path=music_path)
+
+
+def render_video_with_moviepy(
+    video_path: Path,
+    output_path: Path,
+    beat_markers: list[float],
+    mood: str,
+    music_path: Path | None = None,
+    prompt_text: str = "",
+    variation_seed: int | None = None,
+    drop_times: list[float] | None = None,
+    visual_vibe: dict[str, Any] | None = None,
+    audio_features: dict[str, Any] | None = None,
+) -> float:
+    raise RuntimeError("MoviePy renderer is disabled; use render_video_with_pyav_pipeline instead.")
 
     with VideoFileClip(str(video_path)) as clip:
         duration = min(float(clip.duration or 0.0), 45.0)
@@ -7696,60 +7931,104 @@ def render_video_safe_fallback(
     Minimal, resilient render path used only when advanced pipeline fails.
     Keeps API responsive instead of returning HTTP 500.
     """
-    with VideoFileClip(str(video_path)) as clip:
-        duration = min(float(clip.duration or 0.0), 45.0)
-        if duration <= 0:
-            raise ValueError("Uploaded video duration is invalid.")
+    meta = probe_video_metadata(video_path)
+    duration = min(float(meta.get("duration") or 0.0), 45.0)
+    if duration <= 0:
+        raise ValueError("Uploaded video duration is invalid.")
 
-        source_fps = int(clip.fps) if clip.fps else 30
-        target_fps = max(24, min(source_fps, 30))
-        source_w, source_h = int(clip.size[0]), int(clip.size[1])
-        source_pixels = source_w * source_h
-        max_pixels = _max_render_pixels({})
+    ffmpeg_cmd = shutil.which("ffmpeg")
+    if not ffmpeg_cmd:
+        app.logger.warning("[ARCHIVE] FFmpeg not found; using passthrough fallback")
+        shutil.copy2(video_path, output_path)
+        return duration
 
-        base_clip = clip.subclip(0, duration)
-        if source_pixels > max_pixels:
-            scale = math.sqrt(max_pixels / float(source_pixels))
-            new_w = max(640, int((source_w * scale) // 2 * 2))
-            new_h = max(360, int((source_h * scale) // 2 * 2))
-            base_clip = base_clip.resize(newsize=(new_w, new_h))
+    music_exists = bool(music_path) and Path(str(music_path)).exists()
+    app.logger.info("[ARCHIVE] Safe fallback render: music=%s, duration=%.1fs", music_path if music_exists else "NONE", duration)
 
-        music_clip = None
+    tmp_video = output_path.with_name(f"{output_path.stem}_safe_video.mp4")
+    cmd = [
+        ffmpeg_cmd,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *ffmpeg_hwaccel_input_args(),
+        "-i",
+        str(video_path),
+        "-t",
+        f"{duration:.3f}",
+        "-an",
+        "-vf",
+        "scale='min(1280,iw)':-2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        str(tmp_video),
+    ]
+    proc = run_subprocess(cmd, capture_output=True, text=True, timeout=max(120, int(duration * 8)))
+    if not proc.ok:
+        shutil.copy2(video_path, output_path)
+        return duration
+    try:
         if music_path and music_path.exists():
-            try:
-                music_clip = AudioFileClip(str(music_path))
-                if float(music_clip.duration or 0.0) < duration:
-                    music_clip = _audio_loop_clip(music_clip, duration=duration)
-                else:
-                    music_clip = music_clip.subclip(0, duration)
-                base_clip = base_clip.set_audio(music_clip)
-            except Exception:
-                try:
-                    if music_clip:
-                        music_clip.close()
-                except Exception:
-                    pass
-                music_clip = None
-
-        ffmpeg_params = ["-movflags", "+faststart", "-pix_fmt", "yuv420p", "-crf", "19"]
-        base_clip.write_videofile(
-            str(output_path),
-            codec="libx264",
-            audio_codec="aac",
-            preset="veryfast",
-            fps=target_fps,
-            threads=max(2, min(8, os.cpu_count() or 4)),
-            temp_audiofile=str(UPLOAD_DIR / f"temp_audio_safe_{uuid.uuid4().hex}.m4a"),
-            remove_temp=True,
-            ffmpeg_params=ffmpeg_params,
-            logger="bar",
-        )
-
-        out_duration = float(base_clip.duration or duration)
-        base_clip.close()
-        if music_clip:
-            music_clip.close()
-        return out_duration
+            mux_cmd = [
+                ffmpeg_cmd,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(tmp_video),
+                "-stream_loop",
+                "-1",
+                "-i",
+                str(music_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-t",
+                f"{duration:.3f}",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        else:
+            mux_cmd = [
+                ffmpeg_cmd,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(tmp_video),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        proc_mux = run_subprocess(mux_cmd, capture_output=True, text=True, timeout=max(120, int(duration * 8)))
+        if not proc_mux.ok:
+            app.logger.warning("[ARCHIVE] Music muxing failed (stderr=%s); using video-only fallback", proc_mux.stderr[:200] if proc_mux.stderr else "none")
+            shutil.copy2(tmp_video, output_path)
+        else:
+            app.logger.info("[ARCHIVE] Safe fallback render complete with music")
+        return duration
+    finally:
+        tmp_video.unlink(missing_ok=True)
 
 
 def _passthrough_video_fallback(input_path: Path, output_path: Path) -> float:
@@ -7758,11 +8037,7 @@ def _passthrough_video_fallback(input_path: Path, output_path: Path) -> float:
     Prevents user-facing 500s when local codec/environment fails.
     """
     shutil.copy2(input_path, output_path)
-    try:
-        with VideoFileClip(str(output_path)) as c:
-            return float(c.duration or 0.0)
-    except Exception:
-        return 0.0
+    return float(probe_video_metadata(output_path).get("duration") or 0.0)
 
 
 def build_edit_actions(beat_markers: list[float], mood: str) -> list[dict[str, Any]]:
@@ -7858,6 +8133,31 @@ def render_status(render_id: str) -> Any:
     if not payload:
         return jsonify({"ok": False, "render_id": rid, "stage": "unknown", "message": "Render id not found."}), 404
     return jsonify({"ok": True, **payload})
+
+
+@app.post("/api/cancel/<render_id>")
+def cancel_render(render_id: str) -> Any:
+    """Cancel an ongoing render by render_id."""
+    rid = str(render_id or "").strip()
+    if not rid:
+        return jsonify({"error": "render_id is required"}), 400
+    
+    # Mark the render as cancelled
+    _mark_render_cancelled(rid)
+    
+    # Update the status to show it was cancelled
+    _set_render_status(
+        rid,
+        stage="cancelled",
+        progress_pct=100.0,
+        message="Render cancelled by user.",
+        done=True,
+        ok=False,
+        extras={"reason": "user_cancelled"}
+    )
+    
+    app.logger.info("[ARCHIVE] Render %s cancelled by user", rid)
+    return jsonify({"ok": True, "render_id": rid, "message": "Render cancellation requested."})
 
 
 @app.post("/api/plan")
@@ -8116,11 +8416,9 @@ def render() -> Any:
                         "Requested folder music (happy/romantic) was not found in local library. Using source audio only."
                     )
         t_select = time.perf_counter() - t1
-        source_duration = 0.0
-        source_fps = 30.0
-        with VideoFileClip(str(input_path)) as src_clip:
-            source_duration = float(src_clip.duration or 0.0)
-            source_fps = float(src_clip.fps or 30.0)
+        source_meta = probe_video_metadata(input_path)
+        source_duration = float(source_meta.get("duration") or 0.0)
+        source_fps = float(source_meta.get("fps") or 30.0)
 
         if deny_music or skip_music_search:
             t_proxy_rank = 0.0
@@ -8175,6 +8473,11 @@ def render() -> Any:
             except Exception as audio_exc:
                 audio_analysis = {"ok": False, "reason": f"audio_feature_failed:{audio_exc}"}
 
+        # Check if render was cancelled
+        if _is_render_cancelled(render_id):
+            app.logger.info("[ARCHIVE] Render %s was cancelled by user", render_id)
+            return jsonify({"ok": False, "reason": "user_cancelled", "render_id": render_id, "build": BACKEND_BUILD}), 200
+
         app.logger.info("[ARCHIVE] Stage 3/5: beat detection")
         _set_render_status(
             render_id,
@@ -8208,8 +8511,7 @@ def render() -> Any:
                         audio_analysis = None
             except Exception as beat_exc:
                 detected_bpm = int(MOOD_TO_BPM.get(mood, 130))
-                with VideoFileClip(str(input_path)) as src_clip:
-                    safe_duration = float(src_clip.duration or source_duration or 0.0)
+                safe_duration = float(probe_video_metadata(input_path).get("duration") or source_duration or 0.0)
                 beat_markers = generate_beat_markers(safe_duration, detected_bpm)
                 beat_warnings = [f"Video-audio beat fallback used ({beat_exc})."]
             warnings.append("No local music track selected; synced to video audio.")
@@ -8239,6 +8541,12 @@ def render() -> Any:
             message="Rendering timeline and encoding video...",
             done=False,
         )
+        
+        # Check if render was cancelled before starting heavy encoding
+        if _is_render_cancelled(render_id):
+            app.logger.info("[ARCHIVE] Render %s was cancelled by user (before encoding)", render_id)
+            return jsonify({"ok": False, "reason": "user_cancelled", "render_id": render_id, "build": BACKEND_BUILD}), 200
+        
         t3 = time.perf_counter()
         output_name = f"render_{uuid.uuid4().hex}.mp4"
         output_path = OUTPUT_DIR / output_name
@@ -8246,7 +8554,16 @@ def render() -> Any:
         use_brain = bool(style_profile.get("brain_render", True)) and BRAIN_RENDER_AVAILABLE
         if use_brain and not shutil.which("ffmpeg"):
             use_brain = False
-            warnings.append("Brain renderer requires FFmpeg; falling back to MoviePy pipeline.")
+            warnings.append("Brain renderer requires FFmpeg; falling back to PyAV/FFmpeg pipeline.")
+        
+        # Log music file status
+        if local_track and Path(str(local_track)).exists():
+            app.logger.info("[ARCHIVE] Music file ready: %s (%d bytes)", local_track, Path(str(local_track)).stat().st_size)
+        else:
+            app.logger.warning("[ARCHIVE] Music file missing or invalid: %s", local_track)
+        
+        app.logger.info("[ARCHIVE] Render config: use_brain=%s, intensity=%s, brain_available=%s", 
+                       use_brain, style_profile.get("intensity", 2), BRAIN_RENDER_AVAILABLE)
         try:
             if use_brain and run_brain_render:
                 app.logger.info("[ARCHIVE] Stage 4/5: brain render pipeline")
@@ -8278,11 +8595,16 @@ def render() -> Any:
                 )
                 if isinstance(brain_result, dict) and brain_result.get("ok"):
                     render_duration = float(brain_result.get("total_time_sec", 0.0))
+                    render_meta = brain_result.get("render_meta", {}) if isinstance(brain_result, dict) else {}
                     brain_meta = {
                         "brain_quality_score": brain_result.get("quality_score"),
                         "music_drop_time": brain_result.get("music_drop_time"),
                         "arc_phases": brain_result.get("arc_phases"),
                         "render_time_min": brain_result.get("total_time_min"),
+                        "narrative_director_connected": bool(render_meta.get("narrative_director_connected", False)),
+                        "cinematic_director_segments": render_meta.get("cinematic_director_segments"),
+                        "explainability_log": render_meta.get("director_explainability_log", []),
+                        "narrative_summary": render_meta.get("director_narrative_summary", []),
                     }
 
                     _set_render_status(
@@ -8303,19 +8625,27 @@ def render() -> Any:
                     )
                 else:
                     reason = brain_result.get("reason") if isinstance(brain_result, dict) else "unknown"
-                    warnings.append(f"Brain renderer failed ({reason}); falling back to MoviePy pipeline.")
+                    render_meta = brain_result.get("render_meta", {}) if isinstance(brain_result, dict) else {}
+                    app.logger.warning(
+                        "[ARCHIVE] Brain render failed: reason=%s, segments=%s/%s, timed_out=%s", 
+                        reason,
+                        render_meta.get("segments_rendered", "?"),
+                        render_meta.get("segments_requested", "?"),
+                        render_meta.get("timed_out", False),
+                    )
+                    warnings.append(f"Brain renderer failed ({reason}); falling back to PyAV/FFmpeg pipeline.")
                     try:
                         output_path.unlink(missing_ok=True)
                     except Exception:
                         pass
                     _set_render_status(
                         render_id,
-                        stage="moviepy_fallback",
+                        stage="pyav_fallback",
                         progress_pct=72.0,
-                        message="Brain render fallback triggered, switching to MoviePy pipeline...",
+                        message="Brain render fallback triggered, switching to PyAV/FFmpeg pipeline...",
                         done=False,
                     )
-                    render_duration = render_video_with_moviepy(
+                    render_duration = render_video_with_pyav_pipeline(
                         input_path,
                         output_path,
                         beat_markers,
@@ -8328,7 +8658,7 @@ def render() -> Any:
                         audio_features=audio_analysis,
                     )
             else:
-                render_duration = render_video_with_moviepy(
+                render_duration = render_video_with_pyav_pipeline(
                     input_path,
                     output_path,
                     beat_markers,

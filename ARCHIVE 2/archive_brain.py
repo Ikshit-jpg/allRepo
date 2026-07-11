@@ -28,12 +28,14 @@ FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
 CORES = max(2, min(8, os.cpu_count() or 4))
 FRAME_ENGINE_EXE = os.getenv("ARCHIVE_FRAME_ENGINE_EXE") or str(Path(__file__).with_name("archive_frame_engine.exe"))
-BRAIN_MAX_RUNTIME_SEC = int(float(os.getenv("ARCHIVE_BRAIN_MAX_RUNTIME_SEC", "360")))
-BRAIN_SEGMENT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_SEGMENT_TIMEOUT_SEC", "45")))
-BRAIN_FRAME_ENGINE_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_FRAME_ENGINE_TIMEOUT_SEC", "60")))
-BRAIN_TRANSITION_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TRANSITION_TIMEOUT_SEC", "20")))
-BRAIN_CONCAT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_CONCAT_TIMEOUT_SEC", "90")))
+BRAIN_MAX_RUNTIME_SEC = int(float(os.getenv("ARCHIVE_BRAIN_MAX_RUNTIME_SEC", "1740")))
+BRAIN_SEGMENT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_SEGMENT_TIMEOUT_SEC", "120")))
+BRAIN_FRAME_ENGINE_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_FRAME_ENGINE_TIMEOUT_SEC", "75")))
+BRAIN_TRANSITION_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TRANSITION_TIMEOUT_SEC", "45")))
+BRAIN_CONCAT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_CONCAT_TIMEOUT_SEC", "180")))
 BRAIN_MAX_DIMENSION = int(float(os.getenv("ARCHIVE_BRAIN_MAX_DIMENSION", "1280")))
+BRAIN_CPP_MAX_SEGMENT_SEC = float(os.getenv("ARCHIVE_BRAIN_CPP_MAX_SEGMENT_SEC", "2.8"))
+BRAIN_CPP_FAILURE_LIMIT = int(float(os.getenv("ARCHIVE_BRAIN_CPP_FAILURE_LIMIT", "1")))
 
 
 def _log(msg: str, tag: str = "BRAIN") -> None:
@@ -1017,8 +1019,13 @@ class UnifiedRenderEngine:
             "timed_out": False,
             "segments_requested": 0,
             "segments_rendered": 0,
+            "frame_engine_failures": 0,
+            "frame_engine_disabled": False,
+            "frame_engine_skipped_long_segments": 0,
         }
         self.deadline_ts = time.time() + BRAIN_MAX_RUNTIME_SEC
+        self._frame_engine_failures = 0
+        self._frame_engine_disabled = False
 
     def render(
         self,
@@ -1104,6 +1111,12 @@ class UnifiedRenderEngine:
             segment_path = tmp / f"seg_{idx:04d}.mp4"
             transition_sec = 0.08 if heavy else 0.045
             ok = False
+            cxx_safe_segment = (scene.end - scene.start) <= BRAIN_CPP_MAX_SEGMENT_SEC
+            if plan.use_frame_engine and self._frame_engine_disabled:
+                plan.use_frame_engine = False
+            if plan.use_frame_engine and not cxx_safe_segment:
+                plan.use_frame_engine = False
+                self.last_render_meta["frame_engine_skipped_long_segments"] += 1
             if plan.use_frame_engine:
                 raw_path = tmp / f"raw_{idx:04d}.mp4"
                 if self._cut_source_segment(src, raw_path, scene.start, scene.end, speed, info):
@@ -1243,6 +1256,11 @@ class UnifiedRenderEngine:
         ]
         ok, err = _run(cmd, timeout=BRAIN_FRAME_ENGINE_TIMEOUT_SEC)
         if not ok:
+            self._frame_engine_failures += 1
+            self.last_render_meta["frame_engine_failures"] = self._frame_engine_failures
+            if self._frame_engine_failures >= BRAIN_CPP_FAILURE_LIMIT:
+                self._frame_engine_disabled = True
+                self.last_render_meta["frame_engine_disabled"] = True
             _log(f"frame engine segment failed: {err[:180]}", "WARN")
         return ok and out.exists() and out.stat().st_size > 0
 
@@ -1375,6 +1393,8 @@ class UnifiedRenderEngine:
                 f"{duration:.4f}",
                 "-vf",
                 filter_str,
+                "-r",
+                f"{float(_fit_render_info(_probe(src)).get('fps', 30.0)):.3f}",
                 "-an",
                 "-c:v",
                 "libx264",
@@ -1400,8 +1420,16 @@ class UnifiedRenderEngine:
                 "-t",
                 f"{duration:.4f}",
                 "-an",
+                "-r",
+                f"{float(_fit_render_info(_probe(src)).get('fps', 30.0)):.3f}",
                 "-c:v",
-                "copy",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
                 str(out),
             ]
         ok, err = _run(cmd, timeout=BRAIN_SEGMENT_TIMEOUT_SEC)

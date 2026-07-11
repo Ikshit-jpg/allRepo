@@ -198,6 +198,7 @@
     const timerRef = useRef(null);
     const abortRef = useRef(null);
     const downloadBusyRef = useRef(false);
+    const renderIdRef = useRef(null);
 
     useEffect(() => {
       try {
@@ -288,8 +289,17 @@
     };
 
     const cancelRender = () => {
+      // Abort the HTTP request
       if (abortRef.current) {
         abortRef.current.abort();
+      }
+      
+      // Also tell the backend to cancel the render process
+      if (renderIdRef.current) {
+        const renderId = renderIdRef.current;
+        fetch(`${API_BASE}/api/cancel/${renderId}`, {
+          method: "POST",
+        }).catch(err => console.warn("Could not cancel render on backend", err));
       }
     };
 
@@ -353,8 +363,13 @@
       const form = new FormData();
       form.append("prompt", prompt.trim());
       form.append("video", file);
+      
+      // Generate a render_id so we can cancel it if needed
+      const renderId = `render_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      form.append("render_id", renderId);
+      renderIdRef.current = renderId;
 
-      setStatus("ARCHIVE backend: analyzing audio + rendering with librosa/moviepy...");
+      setStatus("ARCHIVE backend: analyzing audio + rendering with PyAV/FFmpeg...");
       setIsRendering(true);
       setRenderUrl("");
       setDownloadUrl("");
@@ -383,6 +398,11 @@
         }
         if (!data) {
           throw new Error("Server returned empty response.");
+        }
+
+        // Store render_id for potential cancellation
+        if (data.render_id) {
+          renderIdRef.current = data.render_id;
         }
 
         setStatus(buildSummary(data));

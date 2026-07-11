@@ -35,6 +35,26 @@ UNSUPPORTED_STYLE_KEYS = {
     "pro_edit_pack",
 }
 
+GLOBAL_EFFECT_STYLE_KEYS = {
+    "black_white",
+    "chroma_pulse",
+    "color_grade",
+    "edge_glow",
+    "fast_motion",
+    "flash",
+    "glitch",
+    "glow",
+    "grain",
+    "motion_blur",
+    "reverse",
+    "shake",
+    "slow_motion",
+    "speed_lines",
+    "speed_ramp",
+    "vignette",
+    "zoom",
+}
+
 
 def _log(msg: str) -> None:
     print(f"[FAST] {msg}", flush=True)
@@ -122,7 +142,13 @@ def _probe(path: str | Path) -> dict[str, Any]:
 def is_fast_render_compatible(style: dict[str, Any] | None, has_music: bool) -> bool:
     del has_music
     profile = style or {}
-    return not any(bool(profile.get(key, False)) for key in UNSUPPORTED_STYLE_KEYS)
+    explicit_effects = [str(key) for key in profile.get("explicit_effects", []) or []]
+    if explicit_effects:
+        return False
+    if int(profile.get("intensity", 1) or 1) >= 2 and not bool(profile.get("simple_mode", False)):
+        return False
+    blocked_keys = UNSUPPORTED_STYLE_KEYS | GLOBAL_EFFECT_STYLE_KEYS
+    return not any(bool(profile.get(key, False)) for key in blocked_keys)
 
 
 def _mood_grade(mood: str, intensity: int) -> dict[str, Any]:

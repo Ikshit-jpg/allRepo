@@ -29,10 +29,10 @@ for package_name, import_name in packages_to_test:
     try:
         __import__(import_name)
         passed.append(package_name)
-        print(f"✅ {package_name}")
+        print(f"[OK] {package_name}")
     except ImportError as e:
         failed.append((package_name, str(e)))
-        print(f"❌ {package_name} - {e}")
+        print(f"[FAIL] {package_name} - {e}")
 
 print(f"\n{'='*60}")
 print(f"PASSED: {len(passed)}/{len(packages_to_test)}")
@@ -44,5 +44,5 @@ if failed:
         print(f"  - {pkg}")
     sys.exit(1)
 else:
-    print("\n✅ All required packages are installed!")
+    print("\n[OK] All required packages are installed!")
     sys.exit(0)

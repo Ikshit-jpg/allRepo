@@ -10,4 +10,5 @@ taste_system_tests:
   rules:
     - exists: ["ARCHIVE 2/tests/test_taste_system.py"]
   script:
+    - python -m py_compile "ARCHIVE 2/brain/archive_brain.py" "ARCHIVE 2/brain/taste_system.py" "ARCHIVE 2/brain/director.py" "ARCHIVE 2/brain/editor_personality.py"
     - python "ARCHIVE 2/tests/test_taste_system.py"

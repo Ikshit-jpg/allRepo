@@ -147,12 +147,17 @@ if not AI_EDITOR_EXE:
     if AI_EDITOR_EXE:
         print(f"[BOOT] AI Editor cortex detected at: {AI_EDITOR_EXE}")
 try:
-    from archive_brain import run_brain_render  # type: ignore
+    from brain.archive_brain import run_brain_render  # type: ignore
 
     BRAIN_RENDER_AVAILABLE = True
 except Exception:
-    run_brain_render = None
-    BRAIN_RENDER_AVAILABLE = False
+    try:
+        from archive_brain import run_brain_render  # type: ignore
+
+        BRAIN_RENDER_AVAILABLE = True
+    except Exception:
+        run_brain_render = None
+        BRAIN_RENDER_AVAILABLE = False
 
 try:
     import joblib  # type: ignore
@@ -243,11 +248,11 @@ def _bootstrap_bundled_ffmpeg() -> str:
 
 
 BOOTSTRAPPED_FFMPEG_EXE = _bootstrap_bundled_ffmpeg()
-ARCHIVE_BRAIN_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TIMEOUT_SEC", "420")))
+ARCHIVE_BRAIN_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TIMEOUT_SEC", "1740")))
 ARCHIVE_EXTERNAL_EFFECT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_EXTERNAL_EFFECT_TIMEOUT_SEC", "90")))
-ARCHIVE_SPEED_MODE = os.getenv("ARCHIVE_SPEED_MODE", "1").strip().lower() in {"1", "true", "yes", "on"}
-ARCHIVE_DEFAULT_FAST_RENDER = os.getenv("ARCHIVE_DEFAULT_FAST_RENDER", "1").strip().lower() in {"1", "true", "yes", "on"}
-ARCHIVE_DEFAULT_BRAIN_RENDER = os.getenv("ARCHIVE_DEFAULT_BRAIN_RENDER", "0").strip().lower() in {"1", "true", "yes", "on"}
+ARCHIVE_SPEED_MODE = os.getenv("ARCHIVE_SPEED_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+ARCHIVE_DEFAULT_FAST_RENDER = os.getenv("ARCHIVE_DEFAULT_FAST_RENDER", "0").strip().lower() in {"1", "true", "yes", "on"}
+ARCHIVE_DEFAULT_BRAIN_RENDER = os.getenv("ARCHIVE_DEFAULT_BRAIN_RENDER", "1").strip().lower() in {"1", "true", "yes", "on"}
 ARCHIVE_FAST_MAX_DURATION_SEC = float(os.getenv("ARCHIVE_FAST_MAX_DURATION_SEC", "30"))
 ARCHIVE_FAST_MAX_PIXELS = int(float(os.getenv("ARCHIVE_FAST_MAX_PIXELS", str(1920 * 1080))))
 ARCHIVE_QUALITY_MAX_PIXELS = int(float(os.getenv("ARCHIVE_QUALITY_MAX_PIXELS", str(3840 * 2160))))
@@ -2081,11 +2086,22 @@ def _max_render_pixels(style: dict[str, Any], *, fallback_pixels: int = 3840 * 2
 
 def _apply_performance_defaults(prompt: str, style_profile: dict[str, Any]) -> dict[str, Any]:
     """
-    Keep the default UX fast. Heavy engines are still available when explicitly requested.
+    Prefer the best edit path by default: brain/C++ effects on selected hero moments,
+    while keeping the fast/global renderer out of effect-heavy renders.
     """
     profile = dict(style_profile or {})
     if not ARCHIVE_SPEED_MODE:
-        profile.setdefault("brain_render", ARCHIVE_DEFAULT_BRAIN_RENDER)
+        profile["brain_render"] = ARCHIVE_DEFAULT_BRAIN_RENDER
+        profile["fast_render"] = False
+        profile["disable_fast_renderer"] = True
+        profile["quality_priority"] = True
+        profile["advanced_compositor"] = True
+        profile["cpp_render_clip"] = True
+        profile["selective_beats"] = True
+        profile["all_beats"] = False
+        profile["heavy_effects_engine"] = True
+        if not bool(profile.get("simple_mode", False)):
+            profile["intensity"] = max(2, int(profile.get("intensity", 2) or 2))
         return profile
 
     text = (prompt or "").lower()
@@ -7828,11 +7844,16 @@ def render() -> Any:
                 )
                 if isinstance(brain_result, dict) and brain_result.get("ok"):
                     render_duration = float(brain_result.get("total_time_sec", 0.0))
+                    render_meta = brain_result.get("render_meta", {}) if isinstance(brain_result, dict) else {}
                     brain_meta = {
                         "brain_quality_score": brain_result.get("quality_score"),
                         "music_drop_time": brain_result.get("music_drop_time"),
                         "arc_phases": brain_result.get("arc_phases"),
                         "render_time_min": brain_result.get("total_time_min"),
+                        "narrative_director_connected": bool(render_meta.get("narrative_director_connected", False)),
+                        "cinematic_director_segments": render_meta.get("cinematic_director_segments"),
+                        "explainability_log": render_meta.get("director_explainability_log", []),
+                        "narrative_summary": render_meta.get("director_narrative_summary", []),
                     }
 
                     _set_render_status(

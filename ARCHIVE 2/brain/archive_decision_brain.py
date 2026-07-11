@@ -798,7 +798,7 @@ class VelocityEngine:
                '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
                output_path]
         try:
-            result = subprocess.run(cmd, timeout=120)
+            result = subprocess.run(cmd, timeout=400)
             return result.returncode == 0
         except Exception as e:
             print(f"[Velocity] FFmpeg failed: {e}")
@@ -1176,7 +1176,7 @@ class RenderOrchestrator:
             str(self.width), str(self.height), f'{self.fps:.1f}'
         ]
         try:
-            r = subprocess.run(cmd, timeout=120)
+            r = subprocess.run(cmd, timeout=400)
             return r.returncode == 0
         except:
             return False  # transitions are optional
@@ -2548,7 +2548,7 @@ def run_single_effect(input_path: str, output_path: str,
                 '-i', input_path,
                 '-vf', f'eq=contrast={1+intensity*0.3:.2f}:saturation={1+intensity*0.3:.2f}',
                 '-c:v', 'libx264', '-preset', preset, '-crf', str(crf), '-an', output_path
-            ], timeout=120)
+            ], timeout=400)
             return r2.returncode == 0
         except: return False
 
@@ -2567,7 +2567,7 @@ def run_transition_preview(clip_a: str, clip_b: str, trans_type: str,
            str(n_frames), str(crf), preset,
            str(width), str(height), f'{fps:.1f}']
     try:
-        r = subprocess.run(cmd, timeout=120)
+        r = subprocess.run(cmd, timeout=400)
         return r.returncode == 0
     except Exception as e:
         print(f"[TransPreview] Failed: {e}"); return False
