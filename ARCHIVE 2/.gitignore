@@ -10,12 +10,16 @@ dist/
 # Keep a tiny curated sample outside this ignore if needed.
 phonks/
 
+# Nested/local build folders we do not want in the new repo history.
+ai_editor/
+
 # Compiled native artifacts and vendored runtime binaries
 *.exe
 *.dll
 *.pyd
 *.so
 *.dylib
+*.obj
 cpp/
 ai_editor/build/
 ai_editor/.git/

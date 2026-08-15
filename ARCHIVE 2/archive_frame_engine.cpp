@@ -34,6 +34,8 @@
 #define _USE_MATH_DEFINES
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -420,7 +422,7 @@ public:
             } else {
                 cv::circle(layer,{x,y},std::max(1,r),
                            cv::Scalar(col[0],col[1],col[2]),-1,cv::LINE_AA);
-                if(r>=2) {
+                if(r>=3) {
                     // Glow ring
                     cv::Mat gl=cv::Mat::zeros(h,w,CV_8UC3);
                     cv::circle(gl,{x,y},r*2,cv::Scalar(col[0]/2,col[1]/2,col[2]/2),-1);
@@ -1259,13 +1261,71 @@ static bool source_has_audio(const std::string& path) {
 
 static bool encode_frames(const fs::path& dir, const std::string& out,
     double fps, const std::string& audio="", int crf=16,
-    const std::string& preset="veryfast")
+    const std::string& preset="veryfast", const std::string& ext="png")
 {
     std::ostringstream c;
-    c<<" -framerate "<<fps<<" -i \""<<(dir/"f_%06d.png").string()<<"\"";
+    c<<" -framerate "<<fps<<" -i \""<<(dir/("f_%06d."+ext)).string()<<"\"";
     if(source_has_audio(audio)) c<<" -i \""<<audio<<"\" -map 0:v -map 1:a -c:a aac -b:a 192k -shortest";
     c<<" -c:v libx264 -preset "<<preset<<" -crf "<<crf<<" -pix_fmt yuv420p -movflags +faststart \""<<out<<"\"";
     return RUN_FF(c.str());
+}
+
+static bool mux_audio_if_needed(const std::string& video, const std::string& out,
+    const std::string& audio, int crf=16, const std::string& preset="veryfast")
+{
+    if(source_has_audio(audio)) {
+        std::ostringstream c;
+        c<<" -i \""<<video<<"\" -i \""<<audio<<"\" -map 0:v -map 1:a "
+         <<"-c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \""<<out<<"\"";
+        return RUN_FF(c.str());
+    }
+    std::error_code ec;
+    fs::rename(video, out, ec);
+    if(!ec) return true;
+    fs::copy_file(video, out, fs::copy_options::overwrite_existing, ec);
+    return !ec;
+}
+
+static bool open_mp4_writer(cv::VideoWriter& writer, const std::string& path,
+    double fps, int w, int h, std::string& codec_used)
+{
+    const int codecs[] = {
+        cv::VideoWriter::fourcc('a','v','c','1'),
+        cv::VideoWriter::fourcc('H','2','6','4'),
+        cv::VideoWriter::fourcc('m','p','4','v'),
+        cv::VideoWriter::fourcc('M','J','P','G')
+    };
+    const char* names[] = {"avc1", "H264", "mp4v", "MJPG"};
+    for(int i=0;i<4;i++) {
+        writer.open(path, codecs[i], fps, cv::Size(w,h), true);
+        if(writer.isOpened()) {
+            codec_used = names[i];
+            return true;
+        }
+        writer.release();
+    }
+    codec_used.clear();
+    return false;
+}
+
+static bool write_fallback_frame(const cv::Mat& frame, const fs::path& dir, size_t index, const std::string& ext) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "f_%06zu.%s", index, ext.c_str());
+    std::vector<int> params;
+    if(ext == "jpg") params = {cv::IMWRITE_JPEG_QUALITY, 97};
+    return cv::imwrite((dir / buf).string(), frame, params);
+}
+
+static bool encode_image_sequence_fallback_from_dir(
+    const fs::path& dir,
+    const std::string& output,
+    double fps,
+    const std::string& audio,
+    int crf,
+    const std::string& preset,
+    const std::string& ext)
+{
+    return encode_frames(dir, output, fps, audio, crf, preset, ext);
 }
 
 struct VInfo { int w=1280,h=720,total=0; double fps=30,dur=0; };
@@ -1312,8 +1372,33 @@ static bool cmd_render_clip(int argc, char* argv[]) {
     VInfo vi=probe(input);
     cv::VideoCapture cap(input); if(!cap.isOpened()) return false;
 
-    fs::path tmp_dir=fs::temp_directory_path()/("arch_clip_"+std::to_string(std::rand()));
-    fs::create_directories(tmp_dir);
+    auto started=std::chrono::steady_clock::now();
+    tw=std::max(2, tw/2*2);
+    th=std::max(2, th/2*2);
+    fs::path direct_tmp=fs::temp_directory_path()/("arch_clip_direct_"+std::to_string(std::rand())+".mp4");
+    fs::path fallback_dir=fs::temp_directory_path()/("arch_clip_fallback_"+std::to_string(std::rand()));
+    fs::create_directories(fallback_dir);
+    cv::VideoWriter writer;
+    std::string codec_used;
+    bool writer_ok=open_mp4_writer(writer,direct_tmp.string(),fps,tw,th,codec_used);
+    std::atomic<bool> watchdog_abort{false};
+    std::atomic<int> frames_written{0};
+    std::thread watchdog;
+    watchdog = std::thread([&]() {
+        int last_seen = 0;
+        while(!watchdog_abort.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            int now = frames_written.load();
+            if(now <= last_seen) {
+                watchdog_abort.store(true);
+                break;
+            }
+            last_seen = now;
+        }
+    });
+    if(!writer_ok) {
+        std::cerr<<"[PERF] VideoWriter unavailable; using image-sequence fallback\n";
+    }
 
     // Build particle system from effect name
     std::string particle_type="";
@@ -1343,14 +1428,16 @@ static bool cmd_render_clip(int argc, char* argv[]) {
         Compositor comp; comp.set_base(f);
 
         // 1. Lightweight color grade. Avoid stack-heavy LUT allocation in hot CLI paths.
-        f=FX::contrast_sat(f,intensity*0.25f,intensity*0.20f);
+        if(intensity>0.001f) f=FX::contrast_sat(f,intensity*0.25f,intensity*0.20f);
         comp.set_base(f);
 
         // 2. Primary effect (with beat-curve intensity)
         float eff_i=intensity*(0.65f+beat_energy*0.35f);
         cv::Mat effected=f.clone();
 
-        if(effect=="impact_flash_combo"||effect=="zoom_burst_shake") {
+        if(eff_i<=0.001f) {
+            effected=f;
+        } else if(effect=="impact_flash_combo"||effect=="zoom_burst_shake") {
             effected=FX::glow(f,0.52f,0.85f,eff_i*1.30f,t_local);
             effected=FX::chromatic(effected,eff_i*0.90f,t_local);
             effected=FX::camera_shake(effected,eff_i*0.70f,t_local,t_since_beat,fidx);
@@ -1394,7 +1481,7 @@ static bool cmd_render_clip(int argc, char* argv[]) {
         }
 
         // 4. Beat-hit effects (curve-driven, not just if/else)
-        if(beat_energy>0.05f) {
+        if(intensity>0.001f && beat_energy>0.05f) {
             // Vignette pulses with beat
             float vign_i=intensity*0.65f+beat_energy*0.25f;
             effected=FX::vignette(effected,vign_i,t_local);
@@ -1403,12 +1490,12 @@ static bool cmd_render_clip(int argc, char* argv[]) {
                 float flash_i=Curve::beat_decay(t_since_beat)*0.35f*intensity;
                 effected=FX::flash_frame(effected,flash_i);
             }
-        } else {
+        } else if(intensity>0.001f) {
             effected=FX::vignette(effected,intensity*0.60f,t_local);
         }
 
         // 5. Drop: extra effects when it's a drop frame
-        if(is_drop&&fidx<(int)(fps*0.12f)) {
+        if(intensity>0.001f && is_drop&&fidx<(int)(fps*0.12f)) {
             float drop_t=1.f-(float)fidx/(fps*0.12f);
             drop_t=Curve::ease_out(drop_t);
             effected=FX::camera_shake(effected,drop_t*0.90f,t_local,0,fidx);
@@ -1418,7 +1505,7 @@ static bool cmd_render_clip(int argc, char* argv[]) {
         }
 
         // 6. Particle layer (composite over everything)
-        if(psys) {
+        if(psys && intensity>0.001f) {
             float em_energy=beat_energy>0.3f ? beat_energy : 0.f;
             if(em_energy>0||fidx%6==0) psys->emit(tw,th,t_local,em_energy+0.2f);
             psys->update(1.f/fps,tw,th);
@@ -1433,7 +1520,7 @@ static bool cmd_render_clip(int argc, char* argv[]) {
         }
 
         // 7. Film grain always last
-        effected=FX::film_grain(effected,intensity*0.45f,t_local,fidx);
+        if(intensity>0.001f) effected=FX::film_grain(effected,intensity*0.45f,t_local,fidx);
 
         // 8. Animation (curve-driven camera movement)
         float anim_t=t_local;
@@ -1491,18 +1578,56 @@ static bool cmd_render_clip(int argc, char* argv[]) {
             cv::warpAffine(effected,effected,M,effected.size(),cv::INTER_LINEAR,cv::BORDER_REPLICATE);
         }
 
-        // Save frame
-        char buf[32]; std::snprintf(buf,sizeof(buf),"f_%06d.png",fidx);
-        cv::imwrite((tmp_dir/buf).string(),effected);
+        if(watchdog_abort.load()) {
+            std::cerr<<"[WARN] render watchdog triggered; aborting early after frame "<<fidx<<"\n";
+            break;
+        }
+        bool fallback_ok = write_fallback_frame(effected, fallback_dir, fidx, "jpg");
+        if(!fallback_ok) {
+            std::cerr<<"[WARN] fallback frame write failed at frame "<<fidx<<"\n";
+        }
+        if(writer_ok) {
+            writer.write(effected);
+            writer_ok = writer.isOpened();
+        }
+        frames_written.fetch_add(1);
         prev_gray=cv::Mat(); cv::cvtColor(f,prev_gray,cv::COLOR_BGR2GRAY);
         prev_frame=f.clone();
         fidx++;
     }
+    watchdog_abort.store(true);
+    if(watchdog.joinable()) watchdog.join();
     cap.release();
     if(psys) delete psys;
-    if(!fidx){fs::remove_all(tmp_dir);return false;}
-    bool ok=encode_frames(tmp_dir,output,fps,input,crf,preset);
-    fs::remove_all(tmp_dir);
+    if(writer_ok) writer.release();
+    if(!fidx){fs::remove(direct_tmp);fs::remove_all(fallback_dir);return false;}
+    bool ok=false;
+    std::string path_used="videowriter";
+    if(writer_ok && fs::exists(direct_tmp) && fs::file_size(direct_tmp)>0) {
+        ok=mux_audio_if_needed(direct_tmp.string(),output,input,crf,preset);
+    }
+    if(!ok) {
+        path_used="jpg_fallback";
+        ok=encode_image_sequence_fallback_from_dir(fallback_dir,output,fps,input,crf,preset,"jpg");
+    }
+    if(!ok) {
+        path_used="png_fallback";
+        ok=encode_image_sequence_fallback_from_dir(fallback_dir,output,fps,input,crf,preset,"png");
+    }
+    fs::remove(direct_tmp);
+    fs::remove_all(fallback_dir);
+    auto elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+    double proc_fps = elapsed>0 ? (double)fidx/elapsed : 0.0;
+    std::cerr<<"[PERF] render_clip dur="<<clip_dur
+             <<"s frames="<<fidx
+             <<" res="<<tw<<"x"<<th
+             <<" fps="<<fps
+             <<" proc_fps="<<proc_fps
+             <<" render_sec="<<elapsed
+             <<" effect="<<effect
+             <<" anim="<<anim
+             <<" codec="<<(codec_used.empty()?path_used:codec_used)
+             <<" path="<<path_used<<"\n";
     return ok;
 }
 
@@ -1527,17 +1652,70 @@ static bool cmd_render_transition(int argc, char* argv[]) {
         if(f.cols!=tw||f.rows!=th)cv::resize(f,f,cv::Size(tw,th)); fb.push_back(f.clone());}
     ca.release(); cb.release();
 
-    fs::path tmp_dir=fs::temp_directory_path()/("arch_trans_"+std::to_string(std::rand()));
-    fs::create_directories(tmp_dir);
+    auto started=std::chrono::steady_clock::now();
+    tw=std::max(2, tw/2*2);
+    th=std::max(2, th/2*2);
+    fs::path direct_tmp=fs::temp_directory_path()/("arch_trans_direct_"+std::to_string(std::rand())+".mp4");
+    fs::path fallback_dir=fs::temp_directory_path()/("arch_trans_fallback_"+std::to_string(std::rand()));
+    fs::create_directories(fallback_dir);
+    cv::VideoWriter writer;
+    std::string codec_used;
+    bool writer_ok=open_mp4_writer(writer,direct_tmp.string(),fps,tw,th,codec_used);
+    std::atomic<bool> watchdog_abort{false};
+    std::atomic<int> frames_written{0};
+    std::thread watchdog;
+    watchdog = std::thread([&]() {
+        int last_seen = 0;
+        while(!watchdog_abort.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            int now = frames_written.load();
+            if(now <= last_seen) {
+                watchdog_abort.store(true);
+                break;
+            }
+            last_seen = now;
+        }
+    });
     int n=std::min({(int)fa.size(),(int)fb.size(),n_frames});
     for(int i=0;i<n;i++){
+        if(watchdog_abort.load()) break;
         float t=(float)i/std::max(1,n-1);
         cv::Mat r=Trans::apply(type,fa[i],fb[i],t);
-        char buf[32]; std::snprintf(buf,sizeof(buf),"f_%06d.png",i);
-        cv::imwrite((tmp_dir/buf).string(),r);
+        bool fallback_ok = write_fallback_frame(r, fallback_dir, i, "jpg");
+        if(!fallback_ok) std::cerr<<"[WARN] transition fallback frame write failed at frame "<<i<<"\n";
+        if(writer_ok) {
+            writer.write(r);
+            writer_ok = writer.isOpened();
+        }
+        frames_written.fetch_add(1);
     }
-    bool ok=encode_frames(tmp_dir,output,fps,"",crf,preset);
-    fs::remove_all(tmp_dir); return ok;
+    watchdog_abort.store(true);
+    if(watchdog.joinable()) watchdog.join();
+    if(writer_ok) writer.release();
+    bool ok=false;
+    std::string path_used="videowriter";
+    if(writer_ok && fs::exists(direct_tmp) && fs::file_size(direct_tmp)>0) {
+        ok=mux_audio_if_needed(direct_tmp.string(),output,"",crf,preset);
+    }
+    if(!ok) {
+        path_used="jpg_fallback";
+        ok=encode_image_sequence_fallback_from_dir(fallback_dir,output,fps,"",crf,preset,"jpg");
+    }
+    if(!ok) {
+        path_used="png_fallback";
+        ok=encode_image_sequence_fallback_from_dir(fallback_dir,output,fps,"",crf,preset,"png");
+    }
+    fs::remove(direct_tmp);
+    fs::remove_all(fallback_dir);
+    auto elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+    std::cerr<<"[PERF] render_transition type="<<type
+             <<" frames="<<n
+             <<" res="<<tw<<"x"<<th
+             <<" proc_fps="<<(elapsed>0 ? n/elapsed : 0)
+             <<" render_sec="<<elapsed
+             <<" codec="<<(codec_used.empty()?path_used:codec_used)
+             <<" path="<<path_used<<"\n";
+    return ok;
 }
 
 // --- CMD: apply_effect_single ---
@@ -1552,16 +1730,39 @@ static bool cmd_apply_effect(int argc, char* argv[]) {
 
     VInfo vi=probe(input);
     cv::VideoCapture cap(input); if(!cap.isOpened()) return false;
-    fs::path tmp_dir=fs::temp_directory_path()/("arch_fx_"+std::to_string(std::rand()));
-    fs::create_directories(tmp_dir);
+    auto started=std::chrono::steady_clock::now();
+    int tw=std::max(2, vi.w/2*2), th=std::max(2, vi.h/2*2);
+    fs::path direct_tmp=fs::temp_directory_path()/("arch_fx_direct_"+std::to_string(std::rand())+".mp4");
+    fs::path fallback_dir=fs::temp_directory_path()/("arch_fx_fallback_"+std::to_string(std::rand()));
+    fs::create_directories(fallback_dir);
+    cv::VideoWriter writer;
+    std::string codec_used;
+    bool writer_ok=open_mp4_writer(writer,direct_tmp.string(),vi.fps,tw,th,codec_used);
+    std::atomic<bool> watchdog_abort{false};
+    std::atomic<int> frames_written{0};
+    std::thread watchdog;
+    watchdog = std::thread([&]() {
+        int last_seen = 0;
+        while(!watchdog_abort.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            int now = frames_written.load();
+            if(now <= last_seen) {
+                watchdog_abort.store(true);
+                break;
+            }
+            last_seen = now;
+        }
+    });
 
     cv::Mat prev, prev_gray; int fidx=0;
     while(true){
         cv::Mat f; if(!cap.read(f)||f.empty()) break;
+        if(f.cols!=tw||f.rows!=th) cv::resize(f,f,cv::Size(tw,th));
         float t=(float)fidx/vi.fps;
-        cv::Mat r=FX::contrast_sat(f,intensity*0.25f,intensity*0.20f);
+        cv::Mat r = intensity>0.001f ? FX::contrast_sat(f,intensity*0.25f,intensity*0.20f) : f.clone();
 
-        if(effect=="glow")           r=FX::glow(r,0.52f,0.85f,intensity*1.3f,t);
+        if(intensity<=0.001f)        r=f.clone();
+        else if(effect=="glow")      r=FX::glow(r,0.52f,0.85f,intensity*1.3f,t);
         else if(effect=="chromatic") r=FX::chromatic(r,intensity,t);
         else if(effect=="energy_aura") r=FX::energy_aura(r,intensity,t,{80,160,255});
         else if(effect=="fire_outline") r=FX::fire_outline(r,intensity,t);
@@ -1585,16 +1786,48 @@ static bool cmd_apply_effect(int argc, char* argv[]) {
             r=FX::glow(r,0.55f,0.7f,intensity*0.80f,t);
             r=FX::vignette(r,intensity*0.65f,t);
         }
-        r=FX::film_grain(r,intensity*0.40f,t,fidx);
+        if(intensity>0.001f) r=FX::film_grain(r,intensity*0.40f,t,fidx);
 
-        char buf[32]; std::snprintf(buf,sizeof(buf),"f_%06d.png",fidx);
-        cv::imwrite((tmp_dir/buf).string(),r);
+        if(watchdog_abort.load()) break;
+        bool fallback_ok = write_fallback_frame(r, fallback_dir, fidx, "jpg");
+        if(!fallback_ok) std::cerr<<"[WARN] effect fallback frame write failed at frame "<<fidx<<"\n";
+        if(writer_ok) {
+            writer.write(r);
+            writer_ok = writer.isOpened();
+        }
+        frames_written.fetch_add(1);
         prev=f.clone(); prev_gray=cv::Mat(); cv::cvtColor(f,prev_gray,cv::COLOR_BGR2GRAY);
         fidx++;
     }
+    watchdog_abort.store(true);
+    if(watchdog.joinable()) watchdog.join();
     cap.release();
-    bool ok=encode_frames(tmp_dir,output,vi.fps,input,crf,preset);
-    fs::remove_all(tmp_dir); return ok;
+    if(writer_ok) writer.release();
+    if(!fidx){fs::remove(direct_tmp);fs::remove_all(fallback_dir);return false;}
+    bool ok=false;
+    std::string path_used="videowriter";
+    if(writer_ok && fs::exists(direct_tmp) && fs::file_size(direct_tmp)>0) {
+        ok=mux_audio_if_needed(direct_tmp.string(),output,input,crf,preset);
+    }
+    if(!ok) {
+        path_used="jpg_fallback";
+        ok=encode_image_sequence_fallback_from_dir(fallback_dir,output,vi.fps,input,crf,preset,"jpg");
+    }
+    if(!ok) {
+        path_used="png_fallback";
+        ok=encode_image_sequence_fallback_from_dir(fallback_dir,output,vi.fps,input,crf,preset,"png");
+    }
+    fs::remove(direct_tmp);
+    fs::remove_all(fallback_dir);
+    auto elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+    std::cerr<<"[PERF] apply_effect effect="<<effect
+             <<" frames="<<fidx
+             <<" res="<<tw<<"x"<<th
+             <<" proc_fps="<<(elapsed>0 ? fidx/elapsed : 0)
+             <<" render_sec="<<elapsed
+             <<" codec="<<(codec_used.empty()?path_used:codec_used)
+             <<" path="<<path_used<<"\n";
+    return ok;
 }
 
 // --- CMD: analyze_clip ---

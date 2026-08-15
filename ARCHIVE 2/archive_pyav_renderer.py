@@ -347,7 +347,7 @@ def apply_particles(frame: np.ndarray, t: float, seed: int = 0, count: int = 32)
     return out
 
 
-def _active_style_flags(style: dict[str, Any]) -> list[str]:
+def _active_style_flags(style: Dict[str, Any]) -> List[str]:
     effect_keys = [
         "color_grade", "glow", "edge_glow", "glitch", "chroma_pulse", "grain",
         "shake", "zoom", "flash", "fire_lines", "energy_aura", "particles",
@@ -395,7 +395,7 @@ def _plan_segments(
 
     segments   = []
     total_out  = 0.0
-    fade_dur   = 0.0
+    fade_dur   = cfg.get('fade_dur', 0.35)
     drops_set  = set(drop_times or [])
 
     for i in range(len(boundaries) - 1):
@@ -878,6 +878,9 @@ def render_video_with_pyav(
 
             out_frame_idx = 0   # frames emitted for this segment
             src_frame_idx = 0   # source frames seen in this segment
+            frame_accumulator = 0.0
+
+            segment_done = False
 
             for packet in in_c.demux(in_v):
                 if out_frame_idx >= seg_out_frames:
@@ -900,6 +903,7 @@ def render_video_with_pyav(
                         if frm_time < s_start - 0.02:
                             continue
                         if frm_time > s_end + 0.04:
+                            segment_done = True
                             break
 
                     src_frame_idx += 1
@@ -988,7 +992,6 @@ def render_video_with_pyav(
                             av_frm = av.VideoFrame.from_ndarray(emit_frm, format='rgb24')
                             av_frm = av_frm.reformat(format='yuv420p')
                             av_frm.pts        = pts_out
-                            av_frm.time_base  = fractions.Fraction(1, target_fps)
 
                             for enc_pkt in out_v.encode(av_frm):
                                 out_c.mux(enc_pkt)
@@ -1000,6 +1003,9 @@ def render_video_with_pyav(
                         out_frame_idx += 1
                         total_frames  += 1
                         _log_render_progress(seg_idx)
+
+                if segment_done:
+                    break
 
             if seg_idx % 10 == 0 or seg_idx == len(segments) - 1:
                 _log_render_progress(seg_idx, force=True)

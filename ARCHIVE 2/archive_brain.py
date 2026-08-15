@@ -35,7 +35,7 @@ BRAIN_TRANSITION_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_TRANSITION_TIM
 BRAIN_CONCAT_TIMEOUT_SEC = int(float(os.getenv("ARCHIVE_BRAIN_CONCAT_TIMEOUT_SEC", "180")))
 BRAIN_MAX_DIMENSION = int(float(os.getenv("ARCHIVE_BRAIN_MAX_DIMENSION", "1280")))
 BRAIN_CPP_MAX_SEGMENT_SEC = float(os.getenv("ARCHIVE_BRAIN_CPP_MAX_SEGMENT_SEC", "2.8"))
-BRAIN_CPP_FAILURE_LIMIT = int(float(os.getenv("ARCHIVE_BRAIN_CPP_FAILURE_LIMIT", "1")))
+BRAIN_CPP_FAILURE_LIMIT = int(float(os.getenv("ARCHIVE_BRAIN_CPP_FAILURE_LIMIT", "3")))
 
 
 def _log(msg: str, tag: str = "BRAIN") -> None:
@@ -1022,6 +1022,7 @@ class UnifiedRenderEngine:
             "frame_engine_failures": 0,
             "frame_engine_disabled": False,
             "frame_engine_skipped_long_segments": 0,
+            "frame_engine_perf": [],
         }
         self.deadline_ts = time.time() + BRAIN_MAX_RUNTIME_SEC
         self._frame_engine_failures = 0
@@ -1190,10 +1191,10 @@ class UnifiedRenderEngine:
         info: dict[str, Any],
     ) -> bool:
         duration = max(0.05, end - start)
-        width = int(info["w"])
-        height = int(info["h"])
+        width = max(2, int(info["w"]) // 2 * 2)
+        height = max(2, int(info["h"]) // 2 * 2)
         fps = float(info.get("fps", 30.0))
-        filters = [f"scale={width}:{height}", f"fps={fps:.3f}"]
+        filters = [f"scale={width}:{height}:flags=bicubic", f"fps={fps:.3f}", "format=yuv420p"]
         if speed != 1.0:
             filters.insert(0, f"setpts={1.0 / speed:.4f}*PTS")
         cmd = [
@@ -1221,9 +1222,21 @@ class UnifiedRenderEngine:
             "yuv420p",
             str(out),
         ]
+        started = time.time()
         ok, err = _run(cmd, timeout=BRAIN_SEGMENT_TIMEOUT_SEC)
+        elapsed = time.time() - started
         if not ok:
             _log(f"source cut failed: {err[:120]}", "WARN")
+        else:
+            self._log_frame_engine_perf(
+                "cut_source",
+                {
+                    "duration": round(duration, 3),
+                    "resolution": f"{width}x{height}",
+                    "fps": round(fps, 3),
+                    "render_sec": round(elapsed, 3),
+                },
+            )
         return ok and out.exists() and out.stat().st_size > 0
 
     def _render_directed_segment(
@@ -1235,6 +1248,17 @@ class UnifiedRenderEngine:
         info: dict[str, Any],
         beat_map: dict[str, Any],
     ) -> bool:
+        raw_info = _probe(raw)
+        duration = float(raw_info.get("dur", 0.0) or 0.0)
+        timeout_sec = self._frame_engine_timeout(
+            duration,
+            width=int(info["w"]),
+            height=int(info["h"]),
+            effect_intensity=float(plan.effect_intensity),
+            animation_intensity=float(plan.animation_intensity),
+            effect=plan.effect,
+            is_drop=bool(plan.is_drop),
+        )
         cmd = [
             FRAME_ENGINE_EXE,
             "render_clip",
@@ -1254,15 +1278,80 @@ class UnifiedRenderEngine:
             str(int(info["h"])),
             f"{float(info.get('fps', 30.0)):.3f}",
         ]
-        ok, err = _run(cmd, timeout=BRAIN_FRAME_ENGINE_TIMEOUT_SEC)
-        if not ok:
-            self._frame_engine_failures += 1
-            self.last_render_meta["frame_engine_failures"] = self._frame_engine_failures
-            if self._frame_engine_failures >= BRAIN_CPP_FAILURE_LIMIT:
-                self._frame_engine_disabled = True
-                self.last_render_meta["frame_engine_disabled"] = True
-            _log(f"frame engine segment failed: {err[:180]}", "WARN")
-        return ok and out.exists() and out.stat().st_size > 0
+        last_err = ""
+        started = time.time()
+        for attempt in range(1, 3):
+            ok, err = _run(cmd, timeout=timeout_sec)
+            last_err = err
+            if ok and out.exists() and out.stat().st_size > 0:
+                elapsed = time.time() - started
+                self._frame_engine_failures = 0
+                self.last_render_meta["frame_engine_failures"] = 0
+                fps = float(info.get("fps", 30.0))
+                self._log_frame_engine_perf(
+                    "render_clip",
+                    {
+                        "duration": round(duration, 3),
+                        "resolution": f"{int(info['w'])}x{int(info['h'])}",
+                        "fps": round(fps, 3),
+                        "processing_fps": round((duration * fps) / max(0.001, elapsed), 3),
+                        "render_sec": round(elapsed, 3),
+                        "effect": plan.effect,
+                        "animation": plan.animation,
+                        "timeout_sec": timeout_sec,
+                        "attempt": attempt,
+                    },
+                )
+                return True
+            if attempt == 1:
+                _log(f"frame engine attempt 1 failed; retrying once: {err[:160]}", "WARN")
+        self._frame_engine_failures += 1
+        self.last_render_meta["frame_engine_failures"] = self._frame_engine_failures
+        reason = "timeout" if "timeout" in (last_err or "").lower() else "engine_failed"
+        self._log_frame_engine_perf(
+            "render_clip_failed",
+            {
+                "duration": round(duration, 3),
+                "resolution": f"{int(info['w'])}x{int(info['h'])}",
+                "fps": round(float(info.get("fps", 30.0)), 3),
+                "effect": plan.effect,
+                "animation": plan.animation,
+                "timeout_sec": timeout_sec,
+                "reason": reason,
+                "error": (last_err or "")[:220],
+                "consecutive_failures": self._frame_engine_failures,
+            },
+        )
+        if self._frame_engine_failures >= BRAIN_CPP_FAILURE_LIMIT:
+            self._frame_engine_disabled = True
+            self.last_render_meta["frame_engine_disabled"] = True
+        _log(f"frame engine segment failed after retry: {last_err[:180]}", "WARN")
+        return False
+
+    @staticmethod
+    def _frame_engine_timeout(duration: float, width: int = 1280, height: int = 720,
+                              effect_intensity: float = 0.75, animation_intensity: float = 0.5,
+                              effect: str = "", is_drop: bool = False) -> int:
+        dur = max(0.0, float(duration))
+        w = max(1, int(width))
+        h = max(1, int(height))
+        res_scale = max(1.0, (w * h) / (1280 * 720))
+        effect_weight = 1.0 + max(0.0, float(effect_intensity)) * 1.25 + max(0.0, float(animation_intensity)) * 0.6
+        complexity_bonus = 0.0
+        effect_key = (effect or "").lower()
+        if any(token in effect_key for token in ["energy", "aura", "fire", "glow", "flow", "particle", "shock", "impact", "datamosh", "vhs", "blur"]):
+            complexity_bonus += 0.7
+        if is_drop:
+            complexity_bonus += 0.4
+        estimated = max(BRAIN_FRAME_ENGINE_TIMEOUT_SEC, int(dur * 30 * res_scale * effect_weight * (1.0 + complexity_bonus)))
+        return min(max(estimated, BRAIN_FRAME_ENGINE_TIMEOUT_SEC), 240)
+
+    def _log_frame_engine_perf(self, stage: str, data: dict[str, Any]) -> None:
+        record = {"stage": stage, **data}
+        logs = self.last_render_meta.setdefault("frame_engine_perf", [])
+        if isinstance(logs, list) and len(logs) < 200:
+            logs.append(record)
+        _log(f"{stage} perf {record}", "PERF")
 
     def _make_directed_transition(
         self,
