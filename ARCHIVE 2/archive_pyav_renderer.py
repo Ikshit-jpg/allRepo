@@ -46,6 +46,7 @@ USAGE IN archive_backend.py:
 from __future__ import annotations
 
 import fractions
+import json
 import logging
 import math
 import os
@@ -292,8 +293,12 @@ def apply_glow(frame: np.ndarray, strength: float = 0.35) -> np.ndarray:
     return cv2.addWeighted(frame, 1.0, blur, float(np.clip(strength, 0.1, 0.75)), 0)
 
 
-def apply_grain(frame: np.ndarray, amount: float = 8.0, seed: int = 0) -> np.ndarray:
-    rng = np.random.default_rng(seed)
+def apply_grain(
+    frame: np.ndarray,
+    amount: float = 8.0,
+    seed: int | np.random.Generator = 0,
+) -> np.ndarray:
+    rng = seed if isinstance(seed, np.random.Generator) else np.random.default_rng(seed)
     noise = rng.normal(0.0, float(amount), frame.shape).astype(np.float32)
     return np.clip(frame.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
 
@@ -624,6 +629,40 @@ def _probe_duration(path: str | Path) -> float:
     return 0.0
 
 
+def _validate_output_media(
+    path: str | Path,
+    expected_duration: float,
+    require_audio: bool = False,
+) -> tuple[bool, str]:
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    ok, output = _run_subprocess(
+        [
+            ffprobe, "-v", "error", "-show_entries",
+            "format=duration:stream=codec_type,duration", "-of", "json", str(path),
+        ],
+        timeout=30,
+    )
+    if not ok:
+        return False, f"ffprobe failed: {output}"
+    try:
+        data = json.loads(output)
+        streams = data.get("streams") or []
+        stream_types = {stream.get("codec_type") for stream in streams}
+        if "video" not in stream_types:
+            return False, "output has no video stream"
+        if require_audio and "audio" not in stream_types:
+            return False, "output has no expected audio stream"
+        duration = float((data.get("format") or {}).get("duration") or 0.0)
+        if duration <= 0:
+            duration = max((float(stream.get("duration") or 0.0) for stream in streams), default=0.0)
+        minimum = max(0.1, min(float(expected_duration) * 0.50, float(expected_duration) - 0.1))
+        if duration < minimum:
+            return False, f"output duration {duration:.2f}s is shorter than expected minimum {minimum:.2f}s"
+        return True, f"video={('video' in stream_types)} audio={('audio' in stream_types)} duration={duration:.2f}s"
+    except Exception as exc:
+        return False, f"could not parse output probe: {exc}"
+
+
 def _finalize_with_ffmpeg(
     video_only_path: str | Path,
     output_path: str | Path,
@@ -720,6 +759,12 @@ def _fallback_ffmpeg_copy(
         return 0.0
     try:
         if not _finalize_with_ffmpeg(tmp_video, output_path, music_path, target):
+            return 0.0
+        valid, reason = _validate_output_media(
+            output_path, target, require_audio=bool(music_path and Path(str(music_path)).exists())
+        )
+        if not valid:
+            log.error(f"[PyAV] fallback output validation failed: {reason}")
             return 0.0
         return _probe_duration(output_path) or target
     finally:
@@ -843,6 +888,9 @@ def render_video_with_pyav(
 
     pts_out      = 0        # output frame counter (= output PTS at 1/fps)
     total_frames = 0
+    encode_failures = 0
+    render_error: Exception | None = None
+    grain_rng = np.random.default_rng(seed)
     expected_frames = max(1, int(target_dur * target_fps))
     progress_interval_sec = 5.0
     next_progress_at = time.time() + progress_interval_sec
@@ -977,7 +1025,9 @@ def render_video_with_pyav(
 
                     local_t = out_frame_idx / max(1, target_fps)
                     global_t = pts_out / max(1, target_fps)
-                    impact = bool(seg.get('is_drop', False)) or (seg_idx % 4 == 0)
+                    # Impact timing comes from detected musical drops/shot planning,
+                    # never from a segment's position in the list.
+                    impact = bool(seg.get('is_drop', False))
 
                     if bool(style.get('zoom', False)) or bool(style.get('ken_burns', False)) or (impact and bool(style.get('speed_ramp', False))):
                         frame_np = apply_zoom(frame_np, 1.04 + (0.04 * (0.5 + 0.5 * math.sin(local_t * math.pi))))
@@ -989,7 +1039,7 @@ def render_video_with_pyav(
                     if bool(style.get('glow', False)) or bool(style.get('edge_glow', False)) or bool(style.get('energy_aura', False)):
                         frame_np = apply_glow(frame_np, 0.22 + (0.08 * int(style.get('intensity', 2))))
                     if bool(style.get('grain', False)) or bool(style.get('posterize_time', False)):
-                        frame_np = apply_grain(frame_np, 5.0 + (2.5 * int(style.get('intensity', 2))), seed + total_frames)
+                        frame_np = apply_grain(frame_np, 5.0 + (2.5 * int(style.get('intensity', 2))), grain_rng)
                     if bool(style.get('fire_lines', False)) or bool(style.get('energy_aura', False)):
                         frame_np = apply_fire_border(frame_np, global_t, 0.45 + (0.12 * int(style.get('intensity', 2))))
                     if bool(style.get('particles', False)):
@@ -1029,7 +1079,8 @@ def render_video_with_pyav(
                                 out_c.mux(enc_pkt)
 
                         except Exception as ee:
-                            log.debug(f'[PyAV] encode error: {ee}')
+                            encode_failures += 1
+                            raise RuntimeError(f"frame encode/mux failed at frame {pts_out}: {ee}") from ee
 
                         pts_out       += 1
                         out_frame_idx += 1
@@ -1042,8 +1093,9 @@ def render_video_with_pyav(
             if seg_idx % 10 == 0 or seg_idx == len(segments) - 1:
                 _log_render_progress(seg_idx, force=True)
 
-    except Exception as render_err:
-        log.error(f'[PyAV] render loop error: {render_err}')
+    except Exception as caught_render_error:
+        render_error = caught_render_error
+        log.error(f'[PyAV] render loop error: {caught_render_error}')
     finally:
         try:
             in_c.close()
@@ -1054,20 +1106,32 @@ def render_video_with_pyav(
     try:
         for pkt in out_v.encode(None):
             out_c.mux(pkt)
-    except Exception:
-        pass
+    except Exception as flush_error:
+        render_error = render_error or flush_error
+        log.error(f"[PyAV] video encoder flush failed: {flush_error}")
 
     # Audio is muxed into the closed video-only file by FFmpeg below.
 
     # â”€â”€ 8. CLOSE + VALIDATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
         out_c.close()
-    except Exception:
-        pass
+    except Exception as close_error:
+        render_error = render_error or close_error
+        log.error(f"[PyAV] output container close failed: {close_error}")
 
     elapsed = time.time() - t0
 
     actual_dur = total_frames / target_fps
+    if render_error is not None or total_frames < max(1, int(expected_frames * 0.50)):
+        log.error(
+            "[PyAV] incomplete render; falling back "
+            f"(frames={total_frames}/{expected_frames}, encode_failures={encode_failures}, error={render_error})"
+        )
+        try:
+            Path(video_only_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur)
     if not _finalize_with_ffmpeg(video_only_path, output_path, music_path, actual_dur or target_dur):
         log.error('[PyAV] output finalize failed; using FFmpeg fallback')
         return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur)
@@ -1078,6 +1142,14 @@ def render_video_with_pyav(
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 2048:
         log.error('[PyAV] output file invalid â€” falling back to legacy renderer')
+        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur)
+    valid_output, validation_message = _validate_output_media(
+        output_path,
+        actual_dur or target_dur,
+        require_audio=bool(music_path and Path(str(music_path)).exists()),
+    )
+    if not valid_output:
+        log.error(f"[PyAV] output integrity validation failed: {validation_message}; falling back")
         return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur)
 
     log.info(

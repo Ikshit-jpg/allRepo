@@ -1,4 +1,4 @@
- from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -47,6 +47,14 @@ except ImportError:
             except ImportError:
                 CinematicDirector = None  # type: ignore[assignment]
                 DirectorShotFeatures = None  # type: ignore[assignment]
+
+try:
+    from .quality_judge import QualityJudge
+except ImportError:
+    try:
+        from quality_judge import QualityJudge  # type: ignore
+    except ImportError:
+        QualityJudge = None  # type: ignore[assignment]
 
 try:
     import librosa
@@ -137,17 +145,19 @@ def _probe(path: str | Path) -> dict[str, Any]:
             "fps": round(fps or 30.0, 3),
             "dur": round(duration or 30.0, 3),
             "has_audio": has_audio,
+            "valid": bool(vs),
         }
     except Exception:
         if cv2 is None:
-            return {"w": 1280, "h": 720, "fps": 30.0, "dur": 30.0, "has_audio": False}
+            return {"w": 1280, "h": 720, "fps": 30.0, "dur": 30.0, "has_audio": False, "valid": False}
         cap = cv2.VideoCapture(str(path))
+        valid = bool(cap.isOpened())
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
         dur = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or fps * 30.0) / max(1.0, fps)
         cap.release()
-        return {"w": w, "h": h, "fps": fps, "dur": dur, "has_audio": False}
+        return {"w": w, "h": h, "fps": fps, "dur": dur, "has_audio": False, "valid": valid}
 
 
 class AnalysisCache:
@@ -654,6 +664,7 @@ class DirectedEffectPlan:
     use_frame_engine: bool = False
     beat_csv: str = ""
     is_drop: bool = False
+    effect_operations: list[dict[str, Any]] = field(default_factory=list)
 
 
 class NarrativeArcEngine:
@@ -1161,6 +1172,15 @@ class UnifiedRenderEngine:
         "cinematic_grade": ("cinematic_grade", "subtle_drift"),
         "impact_flash_combo": ("impact_flash_combo", "camera_slam"),
         "energy_aura": ("energy_aura", "handheld_shake"),
+        "color_grade": ("cinematic_grade", "subtle_drift"),
+        "soft_sharpen": ("speed_blur_lines", "subtle_drift"),
+        "grain": ("atmospheric_grade", "subtle_drift"),
+        "vignette": ("atmospheric_grade", "subtle_drift"),
+        "glow": ("energy_aura", "handheld_shake"),
+        "flash": ("impact_flash_combo", "camera_slam"),
+        "rgb_split": ("impact_flash_combo", "camera_slam"),
+        "smear_cut": ("speed_blur_lines", "orbit_right"),
+        "whip_pan_right": ("action", "orbit_right"),
     }
 
     def __init__(self) -> None:
@@ -1181,6 +1201,8 @@ class UnifiedRenderEngine:
             "narrative_director_connected": False,
             "director_explainability_log": [],
             "director_narrative_summary": [],
+            "edit_plan": [],
+            "output_integrity_report": {},
         }
         self.deadline_ts = time.time() + BRAIN_MAX_RUNTIME_SEC
         self._frame_engine_failures = 0
@@ -1244,16 +1266,10 @@ class UnifiedRenderEngine:
         director = MomentEffectDirector(mood, beat_map, style)
         cinematic_timeline = self._build_cinematic_timeline(assignments, beat_map, style)
         taste_filter = self._make_taste_filter(style)
-        previous_segment: Path | None = None
-        previous_scene: SceneRead | None = None
+        planned: list[tuple[float, bool, bool, DirectedEffectPlan]] = []
+        taste_timeline: list[dict[str, Any]] = []
+        taste_energies: list[float] = []
         for idx, (scene, section) in enumerate(assignments):
-            if time.time() > self.deadline_ts:
-                self.last_render_meta["timed_out"] = True
-                _log(
-                    f"brain render deadline reached after {len(segments)} segments; using partial/fallback output",
-                    "TIMEOUT",
-                )
-                break
             midpoint = (scene.start + scene.end) / 2.0
             beat_energy = 0.5
             if beats:
@@ -1263,14 +1279,80 @@ class UnifiedRenderEngine:
             heavy = restraint.should_fire_heavy(scene, beat_energy, section.type, idx, is_peak)
             effect_intensity = restraint.get_effect_intensity(scene, intensity, section.type, heavy)
             plan = director.plan_segment(scene, section, effect_intensity, heavy, idx, beat_energy)
-            director_shot = cinematic_timeline[idx] if idx < len(cinematic_timeline) else None
-            plan = self._apply_taste_filter(plan, taste_filter, scene, section, beat_energy, idx, director_shot)
-            vf = taste.build_filter_chain(scene, section, effect_intensity, style, info)
+            director_shot = dict(cinematic_timeline[idx]) if idx < len(cinematic_timeline) else {}
+            selected_effects = [
+                effect for effect in director_shot.get("effects", [])
+                if isinstance(effect, dict) and str(effect.get("name") or "").strip()
+            ]
+            # Keep the legacy plan only when the director had no usable effect decision.
+            if not selected_effects:
+                selected_effects = [{"name": plan.effect, "strength": plan.effect_intensity}]
+            taste_shot = dict(director_shot)
+            taste_shot.update(
+                {
+                    "start": scene.start,
+                    "end": scene.end,
+                    "energy": float(np.clip(taste_shot.get("energy", beat_energy), 0.0, 1.0)),
+                    "is_drop": bool(plan.is_drop or section.type == "drop" or taste_shot.get("is_drop", False)),
+                    "has_speech": scene.scene_type == "dialogue" or bool(taste_shot.get("has_speech", False)),
+                    "transition": str(taste_shot.get("transition") or plan.transition),
+                    "effects": selected_effects,
+                }
+            )
+            if "intent" not in taste_shot:
+                taste_shot["intent"] = self._taste_intent(scene, section, beat_energy)
+            taste_timeline.append(taste_shot)
+            taste_energies.append(taste_shot["energy"])
+            planned.append((beat_energy, is_peak, heavy, plan))
+
+        if taste_filter is not None:
+            try:
+                taste_timeline = taste_filter.filter_timeline(
+                    taste_timeline, taste_energies, preserve_effects=True
+                )
+                self.last_render_meta["taste_filtered_segments"] = len(taste_timeline)
+            except Exception as exc:
+                _log(f"taste filter failed for timeline: {exc}", "WARN")
+        if QualityJudge is not None:
+            try:
+                quality_report = QualityJudge().evaluate(taste_timeline).to_dict()
+                quality_report["evaluation_stage"] = "pre_render_timeline"
+                self.last_render_meta["timeline_quality_report"] = quality_report
+            except Exception as exc:
+                _log(f"timeline quality evaluation failed: {exc}", "WARN")
+
+        previous_segment: Path | None = None
+        previous_scene: SceneRead | None = None
+        for idx, ((scene, section), (beat_energy, is_peak, heavy, plan), filtered_shot) in enumerate(
+            zip(assignments, planned, taste_timeline)
+        ):
+            if time.time() > self.deadline_ts:
+                self.last_render_meta["timed_out"] = True
+                _log(
+                    f"brain render deadline reached after {len(segments)} segments; using partial/fallback output",
+                    "TIMEOUT",
+                )
+                break
+            plan = self._apply_taste_filter(plan, filtered_shot, idx)
+            vf = taste.build_filter_chain(scene, section, plan.effect_intensity, style, info)
             speed = 1.0
             if scene.scene_type == "impact" and heavy and bool(style.get("speed_ramp", False)):
                 speed = 1.25
             elif scene.scene_type == "reaction" and heavy and bool(style.get("slow_motion", False)):
                 speed = 0.70
+            self.last_render_meta["edit_plan"].append(
+                {
+                    "start": float(scene.start),
+                    "end": float(scene.end),
+                    "scene_type": scene.scene_type,
+                    "intent": filtered_shot.get("intent"),
+                    "effects": [dict(effect) for effect in filtered_shot.get("effects", [])],
+                    "operations": [dict(operation) for operation in plan.effect_operations],
+                    "speed": speed,
+                    "transition": plan.transition,
+                    "is_drop": bool(plan.is_drop or filtered_shot.get("is_drop", False)),
+                }
+            )
             segment_path = tmp / f"seg_{idx:04d}.mp4"
             transition_sec = 0.08 if heavy else 0.045
             ok = False
@@ -1468,46 +1550,54 @@ class UnifiedRenderEngine:
     def _apply_taste_filter(
         self,
         plan: DirectedEffectPlan,
-        taste_filter: Any,
-        scene: SceneRead,
-        section: NarrativeSection,
-        beat_energy: float,
+        filtered_shot: dict[str, Any],
         idx: int,
-        director_shot: dict[str, Any] | None = None,
     ) -> DirectedEffectPlan:
-        if taste_filter is None:
-            return plan
         try:
-            shot = dict(director_shot or {})
-            shot.update(
-                {
-                    "start": scene.start,
-                    "end": scene.end,
-                    "energy": float(np.clip(shot.get("energy", beat_energy), 0.0, 1.0)),
-                    "is_drop": bool(plan.is_drop or section.type == "drop" or shot.get("is_drop", False)),
-                    "has_speech": scene.scene_type == "dialogue" or bool(shot.get("has_speech", False)),
-                    "transition": str(shot.get("transition") or plan.transition),
-                    "effects": [{"name": plan.effect, "strength": plan.effect_intensity}],
-                }
-            )
-            if "intent" not in shot:
-                shot["intent"] = self._taste_intent(scene, section, beat_energy)
-            filtered = taste_filter.filter_timeline([shot], [shot["energy"]])[0]
-            effects = filtered.get("effects") or []
+            effects = filtered_shot.get("effects") or []
             if effects:
-                picked = max(effects, key=lambda e: float(e.get("strength", 0.0) or 0.0))
-                name = str(picked.get("name") or plan.effect)
-                strength = float(picked.get("strength", plan.effect_intensity) or plan.effect_intensity)
-                mapped_effect, mapped_animation = self.TASTE_EFFECT_MAP.get(name, (name, plan.animation))
+                plan.effect_operations = []
+                for effect in effects:
+                    name = str(effect.get("name") or "").strip()
+                    if not name:
+                        continue
+                    try:
+                        strength = float(effect.get("strength", plan.effect_intensity) or plan.effect_intensity)
+                    except (TypeError, ValueError):
+                        strength = plan.effect_intensity
+                    mapped_effect, mapped_animation = self.TASTE_EFFECT_MAP.get(name, ("cinematic_grade", plan.animation))
+                    plan.effect_operations.append(
+                        {
+                            "name": mapped_effect,
+                            "animation": mapped_animation or plan.animation,
+                            "strength": float(np.clip(strength, 0.05, 1.0)),
+                        }
+                    )
+                picked = max(plan.effect_operations, key=lambda effect: effect["strength"])
+                mapped_effect = picked["name"]
+                mapped_animation = picked["animation"]
                 plan.effect = mapped_effect
                 if mapped_animation:
                     plan.animation = mapped_animation
-                plan.effect_intensity = float(np.clip(strength, 0.05, 1.0))
+                plan.effect_intensity = float(picked["strength"])
                 plan.animation_intensity = float(np.clip(0.20 + plan.effect_intensity * 0.70, 0.15, 1.0))
-            transition = str(filtered.get("transition") or plan.transition)
+                # The native frame engine currently accepts one effect. Use FFmpeg's
+                # composable filter chain whenever the director selected a combo.
+                if len(plan.effect_operations) > 1:
+                    plan.use_frame_engine = False
+            else:
+                # If safety constraints remove every requested effect, retain a
+                # quiet grade instead of accidentally rendering the legacy impact.
+                plan.effect = "cinematic_grade"
+                plan.animation = "subtle_drift"
+                plan.effect_intensity = min(0.25, plan.effect_intensity)
+                plan.animation_intensity = min(0.35, plan.animation_intensity)
+                plan.effect_operations = [
+                    {"name": plan.effect, "animation": plan.animation, "strength": plan.effect_intensity}
+                ]
+            transition = str(filtered_shot.get("transition") or plan.transition)
             if transition:
                 plan.transition = transition
-            self.last_render_meta["taste_filtered_segments"] += 1
         except Exception as exc:
             _log(f"taste filter failed for segment {idx}: {exc}", "WARN")
         return plan
@@ -1720,40 +1810,48 @@ class UnifiedRenderEngine:
         filters = [part for part in [vf] if part]
         width = int(info["w"])
         height = int(info["h"])
-        i = float(np.clip(plan.effect_intensity, 0.05, 1.0))
+        operations = plan.effect_operations or [
+            {"name": plan.effect, "animation": plan.animation, "strength": plan.effect_intensity}
+        ]
+        for operation in operations:
+            effect_name = str(operation.get("name") or plan.effect)
+            animation = str(operation.get("animation") or plan.animation)
+            i = float(np.clip(operation.get("strength", plan.effect_intensity), 0.05, 1.0))
+            if effect_name in {"impact_flash_combo", "impact_frame"}:
+                px = max(4, int(12 * i))
+                blur = max(1, int(3 * i))
+                filters.append(f"eq=brightness={0.12 * i:.4f}:enable='lt(t,0.055)'")
+                filters.append(f"boxblur=luma_radius={blur}:luma_power=1:enable='between(t,0.035,0.130)'")
+                filters.append(f"rgbashift=rh={px}:bh=-{px}:enable='between(t,0.020,0.150)'")
+                filters.append(
+                    f"crop=iw-{px * 2}:ih-{px * 2}:"
+                    f"x={px}+{px}*sin(t*74)*exp(-t*9):"
+                    f"y={px}+{max(1, px // 2)}*cos(t*61)*exp(-t*9),scale={width}:{height}"
+                )
+            elif effect_name in {"speed_blur_lines", "action"}:
+                px = max(3, int(9 * i))
+                filters.append("tmix=frames=3:weights='1 1 1':enable='between(t,0.000,0.240)'")
+                filters.append(f"rgbashift=rh={px}:bh=-{px}:enable='between(t,0.000,0.180)'")
+                filters.append(f"unsharp=luma_msize_x=9:luma_msize_y=3:luma_amount={0.65 + i * 0.55:.3f}")
+            elif effect_name in {"emotional_peak", "portrait_enhance"}:
+                filters.append(f"gblur=sigma={1.0 + i * 1.4:.3f}:enable='between(t,0.000,0.220)'")
+                filters.append(f"eq=brightness={0.025 * i:.4f}:saturation={1.0 + 0.22 * i:.3f}")
+            elif effect_name in {"energy_aura", "dark_surge", "atmospheric_grade"}:
+                filters.append(f"eq=contrast={1.0 + 0.14 * i:.3f}:saturation={1.0 + 0.22 * i:.3f}")
+                filters.append(f"gblur=sigma={0.5 + i:.3f}:enable='between(t,0.000,0.160)'")
+            elif effect_name == "cinematic_grade":
+                filters.append(f"eq=contrast={1.0 + 0.10 * i:.3f}:saturation={1.0 + 0.08 * i:.3f}")
 
-        if plan.effect in {"impact_flash_combo", "impact_frame"}:
-            px = max(4, int(12 * i))
-            blur = max(1, int(3 * i))
-            filters.append(f"eq=brightness={0.12 * i:.4f}:enable='lt(t,0.055)'")
-            filters.append(f"boxblur=luma_radius={blur}:luma_power=1:enable='between(t,0.035,0.130)'")
-            filters.append(f"rgbashift=rh={px}:bh=-{px}:enable='between(t,0.020,0.150)'")
-            filters.append(
-                f"crop=iw-{px * 2}:ih-{px * 2}:"
-                f"x={px}+{px}*sin(t*74)*exp(-t*9):"
-                f"y={px}+{max(1, px // 2)}*cos(t*61)*exp(-t*9),scale={width}:{height}"
-            )
-        elif plan.effect in {"speed_blur_lines", "action"}:
-            px = max(3, int(9 * i))
-            filters.append(f"tmix=frames=3:weights='1 1 1':enable='between(t,0.000,0.240)'")
-            filters.append(f"rgbashift=rh={px}:bh=-{px}:enable='between(t,0.000,0.180)'")
-            filters.append(f"unsharp=luma_msize_x=9:luma_msize_y=3:luma_amount={0.65 + i * 0.55:.3f}")
-        elif plan.effect in {"emotional_peak", "portrait_enhance"}:
-            filters.append(f"gblur=sigma={1.0 + i * 1.4:.3f}:enable='between(t,0.000,0.220)'")
-            filters.append(f"eq=brightness={0.025 * i:.4f}:saturation={1.0 + 0.22 * i:.3f}")
-        elif plan.effect in {"energy_aura", "dark_surge", "atmospheric_grade"}:
-            filters.append(f"eq=contrast={1.0 + 0.14 * i:.3f}:saturation={1.0 + 0.22 * i:.3f}")
-            filters.append(f"gblur=sigma={0.5 + i:.3f}:enable='between(t,0.000,0.160)'")
-
-        if plan.animation in {"camera_slam", "handheld_shake"} and plan.effect not in {"impact_flash_combo", "impact_frame"}:
-            px = max(3, int(8 * plan.animation_intensity))
-            filters.append(
-                f"crop=iw-{px * 2}:ih-{px * 2}:"
-                f"x={px}+{px}*sin(t*58)*exp(-t*5):"
-                f"y={px}+{max(1, px // 2)}*cos(t*49)*exp(-t*5),scale={width}:{height}"
-            )
-        elif plan.animation in {"push_in_slow", "parallax_zoom", "zoom_pulse", "ken_burns_slow"}:
-            filters.append(f"zoompan=z='min(1.08,1+0.045*on/{max(1, int(float(info.get('fps', 30.0))))})':d=1:s={width}x{height}:fps={float(info.get('fps', 30.0)):.3f}")
+            if animation in {"camera_slam", "handheld_shake"} and effect_name not in {"impact_flash_combo", "impact_frame"}:
+                px = max(3, int(8 * i))
+                filters.append(
+                    f"crop=iw-{px * 2}:ih-{px * 2}:"
+                    f"x={px}+{px}*sin(t*58)*exp(-t*5):"
+                    f"y={px}+{max(1, px // 2)}*cos(t*49)*exp(-t*5),scale={width}:{height}"
+                )
+            elif animation in {"push_in_slow", "parallax_zoom", "zoom_pulse", "ken_burns_slow", "orbit_right", "subtle_drift"}:
+                fps = max(1, int(float(info.get("fps", 30.0))))
+                filters.append(f"zoompan=z='min(1.08,1+{0.045 * i:.4f}*on/{fps})':d=1:s={width}x{height}:fps={float(info.get('fps', 30.0)):.3f}")
 
         return ",".join(filters)
 
@@ -2013,6 +2111,20 @@ class UnifiedRenderEngine:
         if not (output.exists() and output.stat().st_size > 0):
             _log(f"concat output invalid or missing: {output}", "WARN")
             return False
+        output_info = _probe(output)
+        has_video = bool(output_info.get("valid") and output_info.get("dur", 0.0) > 0.0)
+        has_audio = bool(output_info.get("has_audio", False))
+        integrity_ok = has_video and (not has_music or has_audio)
+        self.last_render_meta["output_integrity_report"] = {
+            "passed": integrity_ok,
+            "has_video": has_video,
+            "has_audio": has_audio,
+            "audio_expected": has_music,
+            "duration_sec": float(output_info.get("dur", 0.0) or 0.0),
+        }
+        if not integrity_ok:
+            _log(f"concat output failed stream integrity validation: {self.last_render_meta['output_integrity_report']}", "WARN")
+            return False
         return True
 
 
@@ -2212,7 +2324,12 @@ def run_brain_render(
     result["ok"] = bool(result.get("ok", False))
     result["total_time_sec"] = result.get("elapsed_sec", 0.0)
     result["total_time_min"] = result.get("elapsed_min", 0.0)
-    result["quality_score"] = 0.85 if result.get("ok") else 0.0
+    quality_report = (result.get("render_meta") or {}).get("timeline_quality_report") or {}
+    try:
+        result["quality_score"] = float(quality_report.get("score", 0.0))
+    except (TypeError, ValueError):
+        result["quality_score"] = 0.0
+    result["quality_report"] = quality_report
     drops = result.get("drops", [])
     result["music_drop_time"] = drops[0] if drops else None
     result["arc_phases"] = result.get("sections", [])

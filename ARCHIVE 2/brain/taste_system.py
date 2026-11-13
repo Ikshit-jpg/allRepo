@@ -98,9 +98,10 @@ class TasteFilter:
     # -- public ------------------------------------------------------------
 
     def filter_timeline(self, timeline: List[Dict[str, Any]],
-                        energy_arc: Optional[Sequence[float]] = None
+                        energy_arc: Optional[Sequence[float]] = None,
+                        preserve_effects: bool = False,
                         ) -> List[Dict[str, Any]]:
-        """Rewrites effects/strengths/transitions for every shot."""
+        """Filter a complete timeline, optionally retaining planner effects."""
         n = len(timeline)
         if n == 0:
             return timeline
@@ -111,11 +112,56 @@ class TasteFilter:
             energy = float(shot.get("energy", arc[min(i, len(arc) - 1)]))
             intent = shot.get("intent", "calm")
             shot["energy"] = energy
-            shot["effects"] = self._choose_effects(shot, i, energy, intent, n)
+            if preserve_effects:
+                shot["effects"] = self._filter_selected_effects(shot, i, energy, intent)
+            else:
+                shot["effects"] = self._choose_effects(shot, i, energy, intent, n)
             shot["transition"] = self._choose_transition(shot, energy)
             out.append(shot)
             self._tick_cooldowns()
         return out
+
+    def _filter_selected_effects(self, shot: Dict[str, Any], idx: int,
+                                 energy: float, intent: str
+                                 ) -> List[Dict[str, Any]]:
+        """Apply safety/cooldown constraints without replacing director choices."""
+        has_speech = bool(shot.get("has_speech", intent == "dialogue"))
+        is_drop = bool(shot.get("is_drop", False))
+        heavy_allowed = (
+            not has_speech
+            and energy > 0.55
+            and (idx - self._last_heavy_idx) >= 2
+            and (is_drop or intent == "impact")
+        )
+        selected: List[Dict[str, Any]] = []
+        for effect in shot.get("effects") or []:
+            if not isinstance(effect, dict):
+                continue
+            name = str(effect.get("name") or "").strip()
+            if not name:
+                continue
+            if has_speech and name not in SUBTLE_EFFECTS:
+                continue
+            if name in HEAVY_EFFECTS and not heavy_allowed:
+                continue
+            try:
+                strength = float(effect.get("strength", 0.35) or 0.35)
+            except (TypeError, ValueError):
+                strength = 0.35
+            strength = max(0.05, min(1.0, strength))
+            if has_speech:
+                strength = min(strength, 0.35)
+            selected.append({**effect, "name": name, "strength": strength})
+        for effect in selected:
+            name = effect["name"]
+            self._cooldown[name] = float(self.cooldown_shots)
+            if name in HEAVY_EFFECTS:
+                self._last_heavy_idx = idx
+        # Keep the same cooldown/shot-index semantics as the generated path.
+        self._combo_history.append(frozenset(effect["name"] for effect in selected))
+        if len(self._combo_history) > self.combo_memory:
+            self._combo_history.pop(0)
+        return selected
 
     # -- effect selection ----------------------------------------------------
 
