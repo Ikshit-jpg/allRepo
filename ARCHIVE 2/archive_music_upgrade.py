@@ -13,6 +13,8 @@ import math
 import os
 import random
 import re
+import tempfile
+import threading
 import time
 import uuid
 from collections import deque
@@ -31,6 +33,7 @@ import numpy as np
 
 _FINGERPRINT_CACHE: dict[str, dict[str, Any]] = {}
 _FINGERPRINT_CACHE_PATH = None          # set in init() below
+_FINGERPRINT_CACHE_LOCK = threading.RLock()
 RECENT_TRACKS_MAX = 40                  # was 8 — massive improvement
 SIMILARITY_PENALTY_THRESHOLD = 0.82    # penalise tracks that sound too similar
 NOVELTY_WEIGHT = 2.4                   # how much we reward fresh tracks
@@ -39,30 +42,59 @@ NOVELTY_WEIGHT = 2.4                   # how much we reward fresh tracks
 def init_music_upgrade(runtime_dir: Path) -> None:
     """Call this once at startup, after RUNTIME_DIR is known."""
     global _FINGERPRINT_CACHE_PATH
+    runtime_dir = Path(runtime_dir)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
     _FINGERPRINT_CACHE_PATH = runtime_dir / "fingerprint_cache.json"
     _load_fingerprint_cache()
 
 
 def _load_fingerprint_cache() -> None:
-    if _FINGERPRINT_CACHE_PATH and _FINGERPRINT_CACHE_PATH.exists():
-        try:
-            data = json.loads(_FINGERPRINT_CACHE_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                _FINGERPRINT_CACHE.update(data)
-        except Exception:
-            pass
+    with _FINGERPRINT_CACHE_LOCK:
+        if _FINGERPRINT_CACHE_PATH and _FINGERPRINT_CACHE_PATH.exists():
+            try:
+                data = json.loads(_FINGERPRINT_CACHE_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    _FINGERPRINT_CACHE.update(data)
+            except Exception:
+                pass
 
 
 def _save_fingerprint_cache() -> None:
     if _FINGERPRINT_CACHE_PATH is None:
         return
+    with _FINGERPRINT_CACHE_LOCK:
+        tmp_name = ""
+        try:
+            _FINGERPRINT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(_FINGERPRINT_CACHE, separators=(",", ":"), ensure_ascii=True)
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=_FINGERPRINT_CACHE_PATH.parent,
+                delete=False,
+            ) as tmp:
+                tmp.write(payload)
+                tmp_name = tmp.name
+            os.replace(tmp_name, _FINGERPRINT_CACHE_PATH)
+        except Exception:
+            if tmp_name:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+def _track_cache_key(track_path: Path, prefix: str = "fp") -> str:
     try:
-        _FINGERPRINT_CACHE_PATH.write_text(
-            json.dumps(_FINGERPRINT_CACHE, separators=(",", ":"), ensure_ascii=True),
-            encoding="utf-8",
-        )
+        resolved = track_path.resolve()
     except Exception:
-        pass
+        resolved = track_path.absolute()
+    try:
+        stat = resolved.stat()
+        sig = f"{stat.st_mtime_ns}:{stat.st_size}"
+    except Exception:
+        sig = "missing"
+    return f"{prefix}:{resolved}:{sig}"
 
 
 # ---------------------------------------------------------------------------
@@ -75,15 +107,11 @@ def compute_audio_fingerprint(track_path: Path, duration_sec: float = 12.0) -> d
     Returns a feature dict used to measure inter-track similarity.
     Cached on disk so each track is analysed at most once.
     """
-    cache_key = str(track_path.resolve())
-    try:
-        sig = f"{track_path.stat().st_mtime_ns}:{track_path.stat().st_size}"
-    except Exception:
-        sig = cache_key
-
-    cached = _FINGERPRINT_CACHE.get(cache_key)
-    if cached and cached.get("sig") == sig:
-        return dict(cached["fp"])
+    cache_key = _track_cache_key(track_path, "fp")
+    with _FINGERPRINT_CACHE_LOCK:
+        cached = _FINGERPRINT_CACHE.get(cache_key)
+        if cached and isinstance(cached.get("fp"), dict):
+            return dict(cached["fp"])
 
     try:
         y, sr = librosa.load(str(track_path), sr=22050, mono=True,
@@ -139,8 +167,11 @@ def compute_audio_fingerprint(track_path: Path, duration_sec: float = 12.0) -> d
             "energy_curve": [rng.random() for _ in range(8)],
         }
 
-    _FINGERPRINT_CACHE[cache_key] = {"sig": sig, "fp": fp}
-    if len(_FINGERPRINT_CACHE) % 8 == 0:
+    should_save = False
+    with _FINGERPRINT_CACHE_LOCK:
+        _FINGERPRINT_CACHE[cache_key] = {"fp": fp}
+        should_save = len(_FINGERPRINT_CACHE) % 8 == 0
+    if should_save:
         _save_fingerprint_cache()
     return fp
 
@@ -192,10 +223,11 @@ def detect_music_drop(track_path: Path, duration_sec: float = 0.0) -> dict[str, 
     Returns drop_time_sec and confidence (0–1).
     This is the most important structural moment in phonk/AMV editing.
     """
-    cache_key = f"drop:{track_path.resolve()}"
-    cached = _FINGERPRINT_CACHE.get(cache_key)
-    if cached:
-        return dict(cached)
+    cache_key = _track_cache_key(track_path, "drop")
+    with _FINGERPRINT_CACHE_LOCK:
+        cached = _FINGERPRINT_CACHE.get(cache_key)
+        if cached:
+            return dict(cached)
 
     try:
         load_dur = min(duration_sec, 90.0) if duration_sec > 0 else 90.0
@@ -262,7 +294,8 @@ def detect_music_drop(track_path: Path, duration_sec: float = 0.0) -> dict[str, 
     except Exception as exc:
         result = {"drop_time": None, "confidence": 0.0, "method": f"error:{exc}"}
 
-    _FINGERPRINT_CACHE[cache_key] = result
+    with _FINGERPRINT_CACHE_LOCK:
+        _FINGERPRINT_CACHE[cache_key] = result
     _save_fingerprint_cache()
     return result
 

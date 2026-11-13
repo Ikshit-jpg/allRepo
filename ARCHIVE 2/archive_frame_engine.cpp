@@ -1405,8 +1405,8 @@ static bool cmd_render_clip(int argc, char* argv[]) {
     if(effect.find("fire")!=std::string::npos) particle_type="embers";
     else if(effect.find("energy")!=std::string::npos||effect.find("aura")!=std::string::npos) particle_type="sparks";
     else if(mood=="sad"||mood=="emotional") particle_type="petals";
-    ParticleSystem* psys=nullptr;
-    if(!particle_type.empty()) psys=new ParticleSystem(particle_type, 42);
+    std::unique_ptr<ParticleSystem> psys;
+    if(!particle_type.empty()) psys = std::make_unique<ParticleSystem>(particle_type, 42);
 
     cv::Mat prev_frame, prev_gray;
     int fidx=0;
@@ -1598,7 +1598,6 @@ static bool cmd_render_clip(int argc, char* argv[]) {
     watchdog_abort.store(true);
     if(watchdog.joinable()) watchdog.join();
     cap.release();
-    if(psys) delete psys;
     if(writer_ok) writer.release();
     if(!fidx){fs::remove(direct_tmp);fs::remove_all(fallback_dir);return false;}
     bool ok=false;

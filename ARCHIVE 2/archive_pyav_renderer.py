@@ -278,8 +278,10 @@ def apply_vignette(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
 def apply_rgb_shift(frame: np.ndarray, pixels: int = 5) -> np.ndarray:
     px = int(max(1, min(16, pixels)))
     out = frame.copy()
-    out[:, :, 0] = np.roll(frame[:, :, 0], px, axis=1)
-    out[:, :, 2] = np.roll(frame[:, :, 2], -px, axis=1)
+    out[:, px:, 0] = frame[:, :-px, 0]
+    out[:, :px, 0] = frame[:, :1, 0]
+    out[:, :-px, 2] = frame[:, px:, 2]
+    out[:, -px:, 2] = frame[:, -1:, 2]
     return out
 
 
@@ -300,7 +302,25 @@ def apply_shake(frame: np.ndarray, t: float, amount: int = 8, freq: float = 11.0
     amp = int(max(2, min(24, amount)))
     dx = int(math.sin(t * freq * 2.0 * math.pi) * amp)
     dy = int(math.cos(t * freq * 1.7 * math.pi) * max(1, amp // 2))
-    return np.roll(np.roll(frame, dy, axis=0), dx, axis=1)
+    h, w = frame.shape[:2]
+    mat = np.float32([[1, 0, dx], [0, 1, dy]])
+    if cv2 is not None:
+        return cv2.warpAffine(frame, mat, (w, h), borderMode=cv2.BORDER_REPLICATE)
+    out = frame.copy()
+    if dy > 0:
+        out[dy:, :] = frame[:-dy, :]
+        out[:dy, :] = frame[:1, :]
+    elif dy < 0:
+        out[:dy, :] = frame[-dy:, :]
+        out[dy:, :] = frame[-1:, :]
+    shifted = out.copy()
+    if dx > 0:
+        shifted[:, dx:] = out[:, :-dx]
+        shifted[:, :dx] = out[:, :1]
+    elif dx < 0:
+        shifted[:, :dx] = out[:, -dx:]
+        shifted[:, dx:] = out[:, -1:]
+    return shifted
 
 
 def apply_zoom(frame: np.ndarray, factor: float = 1.08) -> np.ndarray:
@@ -774,12 +794,14 @@ def render_video_with_pyav(
 
     src_fps     = max(1.0, min(120.0, src_fps))
     target_fps  = cfg['target_fps']
+    out_w = max(2, int(src_w) // 2 * 2)
+    out_h = max(2, int(src_h) // 2 * 2)
     target_dur  = min(video_dur,
                       (max(beat_markers) + 3.0) if beat_markers else video_dur)
     target_dur  = min(target_dur, 60.0)   # hard cap 60s
 
     log.info(f'[PyAV] src={src_w}x{src_h} {src_fps:.1f}fps {video_dur:.1f}s  '
-             f'target={target_fps}fps {target_dur:.1f}s')
+             f'target={out_w}x{out_h}@{target_fps}fps {target_dur:.1f}s')
 
     # â”€â”€ 2. PLAN SEGMENTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     segments = _plan_segments(
@@ -801,9 +823,10 @@ def render_video_with_pyav(
 
         # Video stream
         out_v = out_c.add_stream('h264', rate=target_fps)
-        out_v.width    = src_w
-        out_v.height   = src_h
+        out_v.width    = out_w
+        out_v.height   = out_h
         out_v.pix_fmt  = 'yuv420p'
+        out_v.time_base = fractions.Fraction(1, int(target_fps))
         out_v.bit_rate = cfg['bitrate']
         out_v.options  = {
             'preset':  'veryfast',
@@ -816,7 +839,7 @@ def render_video_with_pyav(
 
     # â”€â”€ 5. RENDER LOOP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Pre-compute vignette mask (cached per resolution)
-    vign_mask = _make_vignette_mask(src_h, src_w, cfg['vignette'])
+    vign_mask = _make_vignette_mask(out_h, out_w, cfg['vignette'])
 
     pts_out      = 0        # output frame counter (= output PTS at 1/fps)
     total_frames = 0
@@ -870,9 +893,13 @@ def render_video_with_pyav(
             seek_pts = int(s_start / float(in_v.time_base))
             try:
                 in_c.seek(seek_pts, stream=in_v, backward=True)
+                if hasattr(in_v.codec_context, "flush"):
+                    in_v.codec_context.flush()
             except Exception:
                 try:
                     in_c.seek(0)
+                    if hasattr(in_v.codec_context, "flush"):
+                        in_v.codec_context.flush()
                 except Exception:
                     continue
 
@@ -925,6 +952,11 @@ def render_video_with_pyav(
                     try:
                         rgb_frm = src_frm.reformat(format='rgb24')
                         frame_np = rgb_frm.to_ndarray()  # (H, W, 3) uint8
+                        if frame_np.shape[1] != out_w or frame_np.shape[0] != out_h:
+                            if cv2 is None:
+                                frame_np = frame_np[:out_h, :out_w]
+                            else:
+                                frame_np = cv2.resize(frame_np, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
                     except Exception as de:
                         log.debug(f'[PyAV] decode error seg{seg_idx}: {de}')
                         continue

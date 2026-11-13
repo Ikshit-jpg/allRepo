@@ -530,11 +530,10 @@ def probe_video(path: str) -> dict:
     if cached is not None:
         return cached
 
-    default = {'width': 1280, 'height': 720, 'fps': 30.0, 'duration': 5.0}
+    default = {'width': 1280, 'height': 720, 'fps': 30.0, 'duration': 5.0, 'has_audio': False}
     ok, stdout, _ = run_subprocess_safe(
         ['ffprobe', '-v', 'error',
-         '-select_streams', 'v:0',
-         '-show_entries', 'stream=width,height,r_frame_rate,duration',
+         '-show_entries', 'stream=codec_type,width,height,r_frame_rate,duration',
          '-show_entries', 'format=duration',
          '-of', 'json', path],
         timeout_sec=10
@@ -545,7 +544,8 @@ def probe_video(path: str) -> dict:
     try:
         import json
         data   = json.loads(stdout)
-        stream = data.get('streams', [{}])[0]
+        streams = data.get('streams', [])
+        stream = next((s for s in streams if s.get('codec_type') == 'video'), streams[0] if streams else {})
         fmt    = data.get('format', {})
 
         def safe_float(s, d):
@@ -570,7 +570,13 @@ def probe_video(path: str) -> dict:
             fps = safe_float(fps_str, 30.0)
         fps = max(1.0, min(120.0, fps))
 
-        result = {'width': w, 'height': h, 'fps': fps, 'duration': dur}
+        result = {
+            'width': w,
+            'height': h,
+            'fps': fps,
+            'duration': dur,
+            'has_audio': any(s.get('codec_type') == 'audio' for s in streams),
+        }
         _probe_cache.put(path, result)
         return result
     except Exception:
@@ -903,13 +909,15 @@ def fallback_render(
     brightness = b * i * 0.6
     angle      = 0.12 + i * 0.38
 
+    width = max(2, int(width) // 2 * 2)
+    height = max(2, int(height) // 2 * 2)
+    source_info = probe_video(video_path)
     vf = (f'scale={width}:{height}:flags=bilinear,'
           f'eq=contrast={contrast:.3f}:saturation={saturation:.3f}'
           f':brightness={brightness:.4f},'
           f'vignette=angle={angle:.4f}')
 
     af = 'loudnorm=I=-16:TP=-1.5:LRA=11'
-    threads = min(4, os.cpu_count() or 2)
 
     # Build command with HW accel
     hwaccel = ffmpeg_hwaccel_input_args()
@@ -926,17 +934,18 @@ def fallback_render(
                 '-c:a', 'aac', '-b:a', '192k',
                 '-af', af,
                 '-shortest']
-    else:
+    elif source_info.get('has_audio', False):
         # BUG #1 FIX: Keep original video AND audio (was using -vn which strips video!)
         # Map video always, map audio if it exists (? = optional)
-        cmd += ['-map', '0:v:0', '-map', '0:a:0?',
+        cmd += ['-map', '0:v:0', '-map', '0:a:0',
                 '-c:a', 'aac', '-b:a', '192k',
                 '-af', af]
+    else:
+        cmd += ['-map', '0:v:0', '-an']
 
     cmd += ['-vf', vf,
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
             '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
-            '-threads', str(threads),
             output_path]
 
     if progress_cb:
@@ -1180,6 +1189,9 @@ def _do_ffmpeg_render(
     BUG #2 FIX: Proper audio stream mapping in all code paths.
     BUG #13 FIX: Uses HW acceleration for decoding.
     """
+    width = max(2, int(width) // 2 * 2)
+    height = max(2, int(height) // 2 * 2)
+
     # Detect if near a drop
     is_drop = False
     if beat_markers:
@@ -1212,8 +1224,8 @@ def _do_ffmpeg_render(
     af = 'loudnorm=I=-16:TP=-1.5:LRA=11'
 
     # Build FFmpeg command with HW accel
-    threads = min(4, os.cpu_count() or 2)
     hwaccel = ffmpeg_hwaccel_input_args()
+    source_info = probe_video(video_path)
 
     cmd = [
         'ffmpeg', '-hide_banner', '-loglevel', 'error',
@@ -1232,12 +1244,13 @@ def _do_ffmpeg_render(
                 '-c:a', 'aac', '-b:a', '192k',
                 '-af', af,
                 '-shortest']
-    else:
+    elif source_info.get('has_audio', False):
         # BUG #2 FIX: Properly map original audio (was dead code before)
-        # 0:a:0? means "map first audio stream if it exists, skip if not"
-        cmd += ['-map', '0:v:0', '-map', '0:a:0?',
+        cmd += ['-map', '0:v:0', '-map', '0:a:0',
                 '-c:a', 'aac', '-b:a', '192k',
                 '-af', af]
+    else:
+        cmd += ['-map', '0:v:0', '-an']
 
     cmd += [
         '-vf', vf,
@@ -1246,7 +1259,6 @@ def _do_ffmpeg_render(
         '-crf', '18',
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
-        '-threads', str(threads),
         output_path,
     ]
 

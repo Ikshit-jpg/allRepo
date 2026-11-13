@@ -363,55 +363,37 @@ def fast_cut_segments(
         reverse = bool(style.get("reverse", False))
         segment_path = output_dir / f"seg_{idx:04d}.mp4"
 
-        if speed == 1.0 and not reverse:
-            cmd = [
-                FFMPEG,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-ss",
-                f"{start:.4f}",
-                "-i",
-                str(input_path),
-                "-t",
-                f"{duration:.4f}",
-                "-an",
-                "-c:v",
-                "copy",
-                str(segment_path),
-            ]
-        else:
-            video_filters: list[str] = []
-            if reverse:
-                video_filters.append("reverse")
-            if speed != 1.0:
-                video_filters.append(f"setpts={1.0 / speed:.4f}*PTS")
-            cmd = [
-                FFMPEG,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-ss",
-                f"{start:.4f}",
-                "-i",
-                str(input_path),
-                "-t",
-                f"{duration:.4f}",
-                "-an",
-                "-vf",
-                ",".join(video_filters),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                str(segment_path),
-            ]
+        video_filters: list[str] = []
+        if reverse:
+            video_filters.append("reverse")
+        if speed != 1.0:
+            video_filters.append(f"setpts={1.0 / speed:.4f}*PTS")
+        video_filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+        cmd = [
+            FFMPEG,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{start:.4f}",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{duration:.4f}",
+            "-an",
+            "-vf",
+            ",".join(video_filters),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            str(segment_path),
+        ]
 
         ok, err = _run(cmd, timeout=1200, label=f"segment {idx:04d}")
         if ok and segment_path.exists() and segment_path.stat().st_size > 0:

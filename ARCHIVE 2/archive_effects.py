@@ -163,46 +163,66 @@ class ProCompositor:
                 return {"ok": False, "error": f"Input file not found: {input_path}"}
 
             cap = cv2.VideoCapture(str(input_path))
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            try:
+                fps = int(cap.get(cv2.CAP_PROP_FPS))
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if fps <= 0:
+                    fps = 30
+                if w <= 0 or h <= 0:
+                    return {"ok": False, "error": f"Could not read video dimensions: {input_path}"}
 
-            tmp = Path(tempfile.mkdtemp())
+                # Pipe raw BGR frames directly to FFmpeg — no temp PNGs
+                cmd = [
+                    FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "rawvideo", "-pix_fmt", "bgr24",
+                    "-s", f"{w}x{h}", "-r", str(fps),
+                    "-i", "pipe:0",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    str(output_path),
+                ]
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
 
-            frame_idx = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+                frame_idx = 0
+                stderr_text = ""
+                try:
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        out = self.process(frame, frame_idx, fps)
+                        try:
+                            proc.stdin.write(out.tobytes())
+                        except (BrokenPipeError, OSError):
+                            break
+                        frame_idx += 1
+                finally:
+                    if proc.stdin:
+                        proc.stdin.close()
 
-                out = self.process(frame, frame_idx, fps)
-                cv2.imwrite(str(tmp / f"{frame_idx:06d}.png"), out)
-                frame_idx += 1
+                proc.wait(timeout=600)
+                if proc.stderr:
+                    raw_err = proc.stderr.read()
+                    stderr_text = raw_err.decode("utf-8", "replace") if isinstance(raw_err, bytes) else str(raw_err)
+                total_frames = frame_idx
+                ok = proc.returncode == 0 and output_path.exists()
+            finally:
+                cap.release()
 
-            cap.release()
-            total_frames = frame_idx
-
-            # Reconstruct video with ffmpeg
-            cmd = [
-                FFMPEG, "-y", "-framerate", str(fps),
-                "-i", str(tmp / "%06d.png"),
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                "-preset", "veryfast", "-crf", "18",
-                str(output_path)
-            ]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
-            ok = r.returncode == 0 and output_path.exists()
-
-            # Cleanup
-            shutil.rmtree(tmp)
-
-            return {
+            result = {
                 "ok": ok,
                 "output": str(output_path),
                 "frames_processed": total_frames,
                 "fps": fps,
                 "render_time_sec": round(time.perf_counter() - t0, 2),
             }
+            if not ok and stderr_text:
+                result["error"] = stderr_text[-1000:]
+            return result
         except Exception as e:
             return {"ok": False, "error": str(e), "render_time_sec": round(time.perf_counter() - t0, 2)}
 
@@ -315,6 +335,15 @@ class EffectEngine:
         "film_grain",
     ]
 
+    def _build_filter_complex(self, filters: list[str]) -> tuple[str, str]:
+        parts: list[str] = []
+        current = "0:v"
+        for idx, filt in enumerate(filters):
+            out = f"vfx{idx}"
+            parts.append(f"[{current}]{filt}[{out}]")
+            current = out
+        return ";".join(parts), current
+
     def apply(
         self,
         input_path: Path,
@@ -349,20 +378,40 @@ class EffectEngine:
             elif eff == "film_grain":
                 filters.append(FilterBuilder.film_grain(intensity))
 
-        vf = ",".join(filters)
         info = probe_video(input_path)
         audio_flags = ["-c:a", "copy"] if preserve_audio and info["has_audio"] else ["-an"]
+        audio_map = ["-map", "0:a:0?"] if preserve_audio and info["has_audio"] else []
 
-        cmd = [
-            FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(input_path),
-            "-vf", vf,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            *audio_flags,
-            "-movflags", "+faststart",
-            str(output_path),
-        ]
+        # Detect complex filtergraphs (semicolons / labeled pads) that need
+        # -filter_complex instead of the simple -vf flag.
+        is_complex = any(";" in f or "[" in f for f in filters)
+
+        if is_complex:
+            vf, video_label = self._build_filter_complex(filters)
+            cmd = [
+                FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(input_path),
+                "-filter_complex", vf,
+                "-map", f"[{video_label}]",
+                *audio_map,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                *audio_flags,
+                "-movflags", "+faststart",
+                str(output_path),
+            ]
+        else:
+            vf = ",".join(filters)
+            cmd = [
+                FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(input_path),
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                *audio_flags,
+                "-movflags", "+faststart",
+                str(output_path),
+            ]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
             ok = r.returncode == 0 and output_path.exists()

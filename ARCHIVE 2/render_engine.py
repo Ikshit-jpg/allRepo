@@ -57,8 +57,14 @@ def run_subprocess(
             for line in pipe:
                 if line:
                     lines.append(line.rstrip())
-                    if len(lines) > 200:
-                        del lines[:100]
+                    if len(lines) > 400:
+                        # Keep first 100 (where errors appear) + last 100
+                        head = lines[:100]
+                        tail = lines[-100:]
+                        lines.clear()
+                        lines.extend(head)
+                        lines.append("... [truncated] ...")
+                        lines.extend(tail)
         except (ValueError, OSError):
             pass
 
@@ -132,14 +138,17 @@ def ffmpeg_path() -> str:
 
 
 def ffmpeg_hwaccel_input_args() -> list[str]:
-    mode = os.getenv("ARCHIVE_FFMPEG_HWACCEL", "auto").strip().lower()
+    # Default to 'none' (CPU decode) to avoid crashes when GPU-decoded frames
+    # hit CPU filter chains (scale, crop, eq). Users can opt-in to GPU decode
+    # via ARCHIVE_FFMPEG_HWACCEL=cuda if they have proper hwdownload filters.
+    mode = os.getenv("ARCHIVE_FFMPEG_HWACCEL", "none").strip().lower()
     if mode in {"0", "false", "off", "none"}:
         return []
     if mode in {"cuda", "nvdec"}:
         return ["-hwaccel", "cuda"]
     if mode in {"qsv", "d3d11va", "dxva2"}:
         return ["-hwaccel", mode]
-    return ["-hwaccel", "auto"]
+    return []  # safe default: CPU decode
 
 
 def prune_runtime_temp(runtime_dir: Path, *, max_age_seconds: int = 3600) -> int:

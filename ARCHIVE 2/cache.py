@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from collections import OrderedDict
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import RLock
 from typing import Any
 
 
 DEFAULT_SIGNATURE_BYTES = 2 * 1024 * 1024
+_FILE_LOCK = RLock()
 
 
 def partial_file_sha256(path: Path, *, sample_bytes: int = DEFAULT_SIGNATURE_BYTES) -> str:
@@ -26,42 +30,57 @@ def file_cache_signature(path: Path, *, sample_bytes: int = DEFAULT_SIGNATURE_BY
 
 
 def load_json_cache(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
+    with _FILE_LOCK:
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
 
 
 def write_json_cache(path: Path, payload: dict[str, Any]) -> bool:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, separators=(",", ":"), ensure_ascii=True), encoding="utf-8")
-        return True
-    except Exception:
-        return False
+    with _FILE_LOCK:
+        tmp_name = ""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+            with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
+                tmp.write(data)
+                tmp_name = tmp.name
+            os.replace(tmp_name, path)
+            return True
+        except Exception:
+            if tmp_name:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return False
 
 
 class LruMemoryCache:
     def __init__(self, max_items: int = 128) -> None:
         self.max_items = max(1, int(max_items))
         self._data: OrderedDict[str, Any] = OrderedDict()
+        self._lock = RLock()
 
     def get(self, key: str) -> Any | None:
-        if key not in self._data:
-            return None
-        value = self._data.pop(key)
-        self._data[key] = value
-        return value
+        with self._lock:
+            if key not in self._data:
+                return None
+            value = self._data.pop(key)
+            self._data[key] = value
+            return value
 
     def set(self, key: str, value: Any) -> None:
-        if key in self._data:
-            self._data.pop(key)
-        self._data[key] = value
-        while len(self._data) > self.max_items:
-            self._data.popitem(last=False)
+        with self._lock:
+            if key in self._data:
+                self._data.pop(key)
+            self._data[key] = value
+            while len(self._data) > self.max_items:
+                self._data.popitem(last=False)
 
 
 def prune_files(

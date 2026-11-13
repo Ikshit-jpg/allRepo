@@ -65,6 +65,10 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
@@ -89,6 +93,20 @@ static inline float clampf(float v){ return clamp(v,0.f,1.f); }
 
 static void LOG(const std::string& m){
     std::cout << "[AUE] " << m << "\n"; std::cout.flush();
+}
+
+static std::string qarg(const std::string& s) {
+#ifdef _WIN32
+    std::string out = "\"";
+    for(char ch : s) out += (ch == '"') ? "\\\"" : std::string(1, ch);
+    out += "\"";
+    return out;
+#else
+    std::string out = "'";
+    for(char ch : s) out += (ch == '\'') ? "'\\''" : std::string(1, ch);
+    out += "'";
+    return out;
+#endif
 }
 
 static bool RUN_FFMPEG(const std::string& args, int timeout=900){
@@ -153,8 +171,7 @@ static bool encode_frames(
 }
 
 // ---------------- Frame pipeline helper ------
-// Applies a per-frame function to the whole video,
-// writing PNG frames to a temp dir then encoding.
+// Applies a per-frame function and streams raw BGR frames to FFmpeg.
 using FProc = std::function<cv::Mat(const cv::Mat&, float /*t_sec*/, int /*idx*/)>;
 
 static bool pipeline(
@@ -167,24 +184,51 @@ static bool pipeline(
     VInfo vi = probe(in);
     cv::VideoCapture cap(in);
     if(!cap.isOpened()){ LOG("Cannot open: "+in); return false; }
-    auto tmp = mktmp("pipe_");
+    int w = std::max(2, vi.w / 2 * 2);
+    int h = std::max(2, vi.h / 2 * 2);
+    std::ostringstream cmd;
+    cmd << FFMPEG_PATH
+        << " -hide_banner -loglevel error -y"
+        << " -f rawvideo -pix_fmt bgr24"
+        << " -s " << w << "x" << h
+        << " -r " << vi.fps
+        << " -i -"
+        << " -an -c:v libx264 -preset " << preset
+        << " -crf " << crf
+        << " -pix_fmt yuv420p -movflags +faststart "
+        << qarg(out);
+#ifdef _WIN32
+    FILE* pipe = _popen(cmd.str().c_str(), "wb");
+    if(pipe) _setmode(_fileno(pipe), _O_BINARY);
+#else
+    FILE* pipe = popen(cmd.str().c_str(), "w");
+#endif
+    if(!pipe){ cap.release(); LOG("Cannot open FFmpeg pipe"); return false; }
     int idx=0;
     LOG("Processing: "+std::to_string(vi.total)+" frames...");
+    bool write_ok = true;
     while(true){
         cv::Mat f;
         if(!cap.read(f)||f.empty()) break;
         float t = (float)(idx/vi.fps);
         cv::Mat r = fn(f,t,idx);
-        char buf[24]; std::snprintf(buf,sizeof(buf),"f_%06d.png",idx);
-        cv::imwrite((tmp/buf).string(),r);
+        if(r.cols != w || r.rows != h) cv::resize(r, r, cv::Size(w, h));
+        if(!r.isContinuous()) r = r.clone();
+        size_t bytes = (size_t)w * (size_t)h * 3u;
+        if(std::fwrite(r.data, 1, bytes, pipe) != bytes) {
+            write_ok = false;
+            break;
+        }
         idx++;
         if(idx%100==0) LOG("  Frame "+std::to_string(idx)+"/"+std::to_string(vi.total));
     }
     cap.release();
-    if(!idx){ rmtmp(tmp); return false; }
-    bool ok = encode_frames(tmp,out,vi.fps,vi.audio?in:"",crf,preset);
-    rmtmp(tmp);
-    return ok;
+#ifdef _WIN32
+    int rc = _pclose(pipe);
+#else
+    int rc = pclose(pipe);
+#endif
+    return idx > 0 && write_ok && rc == 0;
 }
 
 // ---------------- Math helpers ----------------
