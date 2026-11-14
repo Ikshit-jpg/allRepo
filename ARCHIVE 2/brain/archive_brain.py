@@ -10,7 +10,7 @@ import tempfile
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,15 @@ except ImportError:
         from quality_judge import QualityJudge  # type: ignore
     except ImportError:
         QualityJudge = None  # type: ignore[assignment]
+
+try:
+    from .edit_plan import EditPlan, EditPlanShot
+except ImportError:
+    try:
+        from edit_plan import EditPlan, EditPlanShot  # type: ignore
+    except ImportError:
+        EditPlan = None  # type: ignore[assignment,misc]
+        EditPlanShot = None  # type: ignore[assignment,misc]
 
 try:
     import librosa
@@ -171,7 +180,8 @@ class AnalysisCache:
         p = Path(path)
         if not p.exists():
             return "missing"
-        return f"{p.stat().st_size}_{int(p.stat().st_mtime)}"
+        stat = p.stat()
+        return f"{stat.st_size}_{stat.st_mtime_ns}"
 
     def _scene_key(self, video_path: str, start: float, end: float) -> str:
         raw = f"scene:{video_path}:{self._file_sig(video_path)}:{start:.4f}:{end:.4f}"
@@ -179,6 +189,10 @@ class AnalysisCache:
 
     def _beat_key(self, audio_path: str) -> str:
         raw = f"beat:{audio_path}:{self._file_sig(audio_path)}"
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def _shot_database_key(self, video_path: str) -> str:
+        raw = f"shot-database-v1:{video_path}:{self._file_sig(video_path)}"
         return hashlib.md5(raw.encode()).hexdigest()
 
     def get_scene(self, video_path: str, start: float, end: float) -> dict[str, Any] | None:
@@ -214,6 +228,23 @@ class AnalysisCache:
         cache_file = self._dir / f"{key}.json"
         try:
             cache_file.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+
+    def get_shot_database(self, video_path: str) -> list[dict[str, Any]] | None:
+        cache_file = self._dir / f"{self._shot_database_key(video_path)}.json"
+        if cache_file.exists():
+            try:
+                payload = json.loads(cache_file.read_text(encoding="utf-8"))
+                return payload if isinstance(payload, list) else None
+            except Exception:
+                pass
+        return None
+
+    def put_shot_database(self, video_path: str, shots: list[dict[str, Any]]) -> None:
+        cache_file = self._dir / f"{self._shot_database_key(video_path)}.json"
+        try:
+            cache_file.write_text(json.dumps(shots), encoding="utf-8")
         except Exception:
             pass
 
@@ -288,11 +319,14 @@ class SceneRead:
     internal_impacts: list[float] = field(default_factory=list)
     needs_effects: list[str] = field(default_factory=list)
     rejects_effects: list[str] = field(default_factory=list)
+    scene_change_score: float = 0.0
+    source_id: str = ""
 
 
 class SceneUnderstandingEngine:
     def __init__(self) -> None:
         self._face_cascade = self._load_face_cascade()
+        self.cache = AnalysisCache()
 
     def _load_face_cascade(self) -> Any:
         if cv2 is None:
@@ -348,6 +382,120 @@ class SceneUnderstandingEngine:
         scene.edit_value = self._score_edit_value(scene)
         scene.needs_effects, scene.rejects_effects = self._recommend_effects(scene)
         return scene
+
+    def build_shot_database(
+        self,
+        video_path: str | Path,
+        *,
+        max_shots: int = 180,
+        max_shot_seconds: float = 4.5,
+    ) -> list[SceneRead]:
+        """Find shot candidates with a coarse scan and refine around likely cuts."""
+        source = str(Path(video_path).resolve())
+        cached = self.cache.get_shot_database(source)
+        if cached:
+            allowed = SceneRead.__dataclass_fields__.keys()
+            return [SceneRead(**{key: value for key, value in row.items() if key in allowed}) for row in cached]
+
+        if cv2 is None:
+            info = _probe(source)
+            return [self.analyze_segment(source, 0.0, max(0.1, float(info.get("dur", 30.0))))]
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            return []
+        fps = max(1.0, float(cap.get(cv2.CAP_PROP_FPS) or 30.0))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration = frame_count / fps if frame_count > 0 else float(_probe(source).get("dur", 30.0))
+        step = max(1, int(round(fps * 0.40)))
+
+        def signature(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+            hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+            hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+            cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            return hist, gray
+
+        samples: list[tuple[float, np.ndarray, np.ndarray]] = []
+        frame_idx = 0
+        while frame_count <= 0 or frame_idx < frame_count:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            hist, gray = signature(frame)
+            samples.append((frame_idx / fps, hist, gray))
+            frame_idx += step
+        cap.release()
+        if not samples:
+            return []
+
+        cut_candidates: list[tuple[float, float]] = []
+        min_gap = 0.45
+        for idx in range(1, len(samples)):
+            prev_t, prev_hist, prev_gray = samples[idx - 1]
+            curr_t, curr_hist, curr_gray = samples[idx]
+            hist_change = float(cv2.compareHist(prev_hist, curr_hist, cv2.HISTCMP_BHATTACHARYYA))
+            frame_change = float(cv2.absdiff(prev_gray, curr_gray).mean()) / 255.0
+            score = float(np.clip((0.72 * hist_change) + (0.28 * frame_change), 0.0, 1.0))
+            if score < 0.43 or curr_t - (cut_candidates[-1][0] if cut_candidates else 0.0) < min_gap:
+                continue
+
+            # Refine cut timing by sampling more densely only in this interval.
+            best_t = curr_t
+            best_score = score
+            previous_signature = prev_hist
+            refine_cap = cv2.VideoCapture(source)
+            try:
+                for refine_idx in range(1, 8):
+                    refine_t = prev_t + ((curr_t - prev_t) * refine_idx / 8.0)
+                    refine_cap.set(cv2.CAP_PROP_POS_MSEC, refine_t * 1000.0)
+                    refined_ok, refined_frame = refine_cap.read()
+                    if not refined_ok or refined_frame is None:
+                        continue
+                    refined_hist, _ = signature(refined_frame)
+                    refined_score = float(cv2.compareHist(previous_signature, refined_hist, cv2.HISTCMP_BHATTACHARYYA))
+                    if refined_score > best_score:
+                        best_score, best_t = refined_score, refine_t
+                    previous_signature = refined_hist
+            finally:
+                refine_cap.release()
+            cut_candidates.append((best_t, max(score, best_score)))
+
+        if len(cut_candidates) > max_shots - 1:
+            strongest = sorted(cut_candidates, key=lambda item: item[1], reverse=True)[: max_shots - 1]
+            cut_candidates = sorted(strongest)
+        boundaries = [0.0] + [float(t) for t, _ in cut_candidates if 0.15 < t < duration - 0.15] + [duration]
+        # Add adaptive coverage intervals so visually continuous footage still
+        # contributes multiple searchable moments.
+        expanded = [boundaries[0]]
+        for boundary in boundaries[1:]:
+            cursor = expanded[-1]
+            while boundary - cursor > max_shot_seconds:
+                cursor += max_shot_seconds
+                expanded.append(cursor)
+            if boundary - expanded[-1] >= 0.18:
+                expanded.append(boundary)
+        boundaries = sorted(set(expanded))
+        cut_scores = {round(t, 2): score for t, score in cut_candidates}
+
+        shots: list[SceneRead] = []
+        for start, end in zip(boundaries, boundaries[1:]):
+            if end - start < 0.18:
+                continue
+            cut_score = max(
+                (score for cut_t, score in cut_candidates if abs(cut_t - start) <= 0.2),
+                default=0.0,
+            )
+            sample_count = int(np.clip(3 + round((end - start) * 1.5) + (2 if cut_score >= 0.55 else 0), 3, 12))
+            scene = self.analyze_segment(source, start, end, n_samples=sample_count)
+            scene.scene_change_score = float(cut_score)
+            scene.source_id = hashlib.sha1(f"{source}:{start:.3f}:{end:.3f}".encode()).hexdigest()[:16]
+            shots.append(scene)
+
+        if shots:
+            self.cache.put_shot_database(source, [asdict(scene) for scene in shots])
+        return shots
 
     def _analyze_motion(self, frames: list[tuple[float, np.ndarray]]) -> tuple[float, str]:
         if len(frames) < 2:
@@ -755,13 +903,27 @@ class NarrativeArcEngine:
         result: list[tuple[SceneRead, NarrativeSection]] = []
         MAX_REUSE = 2
         MIN_REUSE_GAP = 3
+
+        def music_fit(scene: SceneRead, section: NarrativeSection) -> float:
+            target = float(np.clip(section.energy, 0.0, 1.0))
+            visual_energy = float(np.clip((scene.motion * 0.58) + (scene.emotional_intensity * 0.42), 0.0, 1.0))
+            energy_fit = 1.0 - abs(visual_energy - target)
+            change_fit = float(np.clip(scene.scene_change_score, 0.0, 1.0))
+            if section.type in {"drop", "chorus"}:
+                return (scene.edit_value * 0.36) + (energy_fit * 0.24) + (scene.motion * 0.18) + (scene.cinematic_quality * 0.12) + (change_fit * 0.10)
+            if section.type in {"break", "intro", "outro"}:
+                calm_fit = 1.0 - scene.motion
+                face_fit = 0.08 if scene.has_face else 0.0
+                return (scene.cinematic_quality * 0.32) + (energy_fit * 0.28) + (calm_fit * 0.20) + face_fit + (scene.edit_value * 0.12)
+            return (scene.edit_value * 0.30) + (energy_fit * 0.30) + (scene.cinematic_quality * 0.20) + (scene.motion * 0.12) + (change_fit * 0.08)
+
         for section in self.sections:
             pool = buckets.get(section.type) or scored
             section_duration = section.end - section.start
             used = 0.0
             while used < section_duration and pool:
                 seg_idx = len(result)
-                ranked_pool = sorted(pool, key=lambda sc: (usage_count[id(sc)], -float(sc.edit_value)))
+                ranked_pool = sorted(pool, key=lambda sc: (usage_count[id(sc)], -music_fit(sc, section)))
                 scene = ranked_pool[0]
                 if last_scene_key is not None and id(scene) == last_scene_key and len(ranked_pool) > 1:
                     scene = ranked_pool[1]
@@ -770,8 +932,22 @@ class NarrativeArcEngine:
                         if (seg_idx - last_used_at[id(alt)]) >= MIN_REUSE_GAP:
                             scene = alt
                             break
-                used += max(0.3, min(scene.duration, section_duration - used, 3.0))
-                result.append((scene, section))
+                chosen_duration = max(0.3, min(scene.duration, section_duration - used, 3.0))
+                if scene.duration > chosen_duration + 0.05:
+                    remaining = max(0.0, scene.duration - chosen_duration)
+                    occurrence = usage_count[id(scene)]
+                    offset_fraction = (0.25, 0.75)[occurrence % 2]
+                    clip_start = scene.start + (remaining * offset_fraction)
+                    selected_scene = replace(
+                        scene,
+                        start=round(clip_start, 4),
+                        end=round(clip_start + chosen_duration, 4),
+                        duration=chosen_duration,
+                    )
+                else:
+                    selected_scene = scene
+                used += chosen_duration
+                result.append((selected_scene, section))
                 scene_key = id(scene)
                 usage_count[scene_key] += 1
                 last_used_at[scene_key] = seg_idx
@@ -1321,11 +1497,91 @@ class UnifiedRenderEngine:
             except Exception as exc:
                 _log(f"timeline quality evaluation failed: {exc}", "WARN")
 
-        previous_segment: Path | None = None
-        previous_scene: SceneRead | None = None
+        downbeats = [float(value) for value in beat_map.get("downbeats", [])]
+        kicks = [float(value) for value in beat_map.get("kick_times", [])]
+        snares = [float(value) for value in beat_map.get("snare_times", [])]
+        prepared: list[tuple[SceneRead, NarrativeSection, float, bool, bool, DirectedEffectPlan, float, Any]] = []
+        plan_shots: list[Any] = []
+        output_cursor = 0.0
         for idx, ((scene, section), (beat_energy, is_peak, heavy, plan), filtered_shot) in enumerate(
             zip(assignments, planned, taste_timeline)
         ):
+            plan = self._apply_taste_filter(plan, filtered_shot, idx)
+            speed = 1.0
+            if scene.scene_type == "impact" and heavy and bool(style.get("speed_ramp", False)):
+                speed = 1.25
+            elif scene.scene_type == "reaction" and heavy and bool(style.get("slow_motion", False)):
+                speed = 0.70
+            shot_beats = [float(beat) for beat in beats if scene.start <= float(beat) <= scene.end]
+            downbeat = any(abs(beat - float(t)) <= 0.08 for beat in shot_beats for t in downbeats)
+            nearest_percussion = min(
+                (abs(float(t) - beat) for t in shot_beats for t in kicks + snares),
+                default=float("inf"),
+            )
+            music_relation = (
+                "downbeat" if downbeat else
+                "beat" if shot_beats else
+                "percussion" if nearest_percussion <= 0.08 else
+                "off_beat"
+            )
+            explanation: list[str] = [str(filtered_shot.get("intent") or "")]
+            for log_item in filtered_shot.get("explainability_log") or []:
+                if isinstance(log_item, dict):
+                    explanation.extend(str(reason) for reason in log_item.get("reason", []) if reason)
+            duration_out = max(0.05, (scene.end - scene.start) / max(0.05, speed))
+            shot_plan = None
+            if EditPlanShot is not None:
+                shot_plan = EditPlanShot(
+                    source_start=float(scene.start),
+                    source_end=float(scene.end),
+                    output_start=output_cursor,
+                    output_duration=duration_out,
+                    playback_speed=speed,
+                    beat_times=shot_beats,
+                    is_downbeat=downbeat,
+                    is_drop=bool(plan.is_drop or filtered_shot.get("is_drop", False)),
+                    music_section=str(section.type),
+                    music_relation=music_relation,
+                    creative_intent=str(filtered_shot.get("intent") or self._taste_intent(scene, section, beat_energy)),
+                    effects=[dict(effect) for effect in filtered_shot.get("effects", []) if isinstance(effect, dict)],
+                    render_operations=[dict(operation) for operation in plan.effect_operations],
+                    transition=str(plan.transition),
+                    animation={"name": plan.animation, "strength": float(plan.animation_intensity)},
+                    color_grade={"mood": mood, "strength": float(plan.effect_intensity)},
+                    explanation=list(dict.fromkeys(item for item in explanation if item)),
+                    visual_features=asdict(scene),
+                    source_id=scene.source_id or f"{scene.start:.4f}:{scene.end:.4f}",
+                )
+                shot_plan.validate()
+                plan_shots.append(shot_plan)
+            prepared.append((scene, section, beat_energy, is_peak, heavy, plan, speed, shot_plan))
+            output_cursor += duration_out
+
+        quality_report_data = self.last_render_meta.get("timeline_quality_report", {})
+        if EditPlan is not None and plan_shots:
+            try:
+                edit_plan = EditPlan(
+                    source_video=str(src.resolve()),
+                    shots=plan_shots,
+                    music_timeline=dict(beat_map.get("music_timeline") or {
+                        "bpm": beat_map.get("bpm"),
+                        "beats": beats,
+                        "downbeats": downbeats,
+                        "kicks": kicks,
+                        "snares": snares,
+                        "drops": beat_map.get("drop_times", []),
+                        "sections": beat_map.get("sections", []),
+                        "repeated_patterns": beat_map.get("repeated_patterns", []),
+                    }),
+                    quality_report=dict(quality_report_data),
+                ).validate()
+                self.last_render_meta["edit_plan"] = edit_plan.to_dict()
+            except Exception as exc:
+                _log(f"EditPlan validation failed; using validated segment data: {exc}", "WARN")
+
+        previous_segment: Path | None = None
+        previous_scene: SceneRead | None = None
+        for idx, (scene, section, beat_energy, is_peak, heavy, plan, speed, shot_plan) in enumerate(prepared):
             if time.time() > self.deadline_ts:
                 self.last_render_meta["timed_out"] = True
                 _log(
@@ -1333,30 +1589,34 @@ class UnifiedRenderEngine:
                     "TIMEOUT",
                 )
                 break
-            plan = self._apply_taste_filter(plan, filtered_shot, idx)
-            vf = taste.build_filter_chain(scene, section, plan.effect_intensity, style, info)
-            speed = 1.0
-            if scene.scene_type == "impact" and heavy and bool(style.get("speed_ramp", False)):
-                speed = 1.25
-            elif scene.scene_type == "reaction" and heavy and bool(style.get("slow_motion", False)):
-                speed = 0.70
-            self.last_render_meta["edit_plan"].append(
-                {
-                    "start": float(scene.start),
-                    "end": float(scene.end),
-                    "scene_type": scene.scene_type,
-                    "intent": filtered_shot.get("intent"),
-                    "effects": [dict(effect) for effect in filtered_shot.get("effects", [])],
-                    "operations": [dict(operation) for operation in plan.effect_operations],
-                    "speed": speed,
-                    "transition": plan.transition,
-                    "is_drop": bool(plan.is_drop or filtered_shot.get("is_drop", False)),
-                }
-            )
+            grade = shot_plan.color_grade if shot_plan is not None else {
+                "mood": mood, "strength": float(plan.effect_intensity)
+            }
+            grade_strength = float(np.clip(grade.get("strength", 0.0), 0.0, 1.0))
+            grade_mood = str(grade.get("mood", mood))
+            if grade_mood in {"hype", "dramatic"}:
+                vf = f"eq=contrast={1.0 + 0.22 * grade_strength:.3f}:saturation={1.0 + 0.22 * grade_strength:.3f}"
+            elif grade_mood == "dark":
+                vf = f"eq=contrast={1.0 + 0.25 * grade_strength:.3f}:saturation={1.0 - 0.18 * grade_strength:.3f}:brightness={-0.025 * grade_strength:.4f}"
+            elif grade_mood == "sad":
+                vf = f"eq=contrast={1.0 + 0.12 * grade_strength:.3f}:saturation={1.0 - 0.22 * grade_strength:.3f}"
+            else:
+                vf = f"eq=contrast={1.0 + 0.10 * grade_strength:.3f}:saturation={1.0 + 0.15 * grade_strength:.3f}"
+            if plan.use_frame_engine and len(plan.effect_operations) > 1:
+                # The frame engine accepts one effect. Preserve the complete plan
+                # by routing compound decisions through the keyframed renderer.
+                plan.use_frame_engine = False
+            source_start = float(shot_plan.source_start if shot_plan is not None else scene.start)
+            source_end = float(shot_plan.source_end if shot_plan is not None else scene.end)
             segment_path = tmp / f"seg_{idx:04d}.mp4"
-            transition_sec = 0.08 if heavy else 0.045
+            planned_transition = str(shot_plan.transition if shot_plan is not None else plan.transition)
+            transition_sec = (
+                0.18 if planned_transition in {"fade", "dissolve", "cross_fade"}
+                else 0.08 if planned_transition in {"impact_cut", "flash_cut", "glitch_cut"}
+                else 0.045
+            )
             ok = False
-            cxx_safe_segment = (scene.end - scene.start) <= BRAIN_CPP_MAX_SEGMENT_SEC
+            cxx_safe_segment = (source_end - source_start) <= BRAIN_CPP_MAX_SEGMENT_SEC
             if plan.use_frame_engine and self._frame_engine_disabled:
                 plan.use_frame_engine = False
             if plan.use_frame_engine and not cxx_safe_segment:
@@ -1364,7 +1624,7 @@ class UnifiedRenderEngine:
                 self.last_render_meta["frame_engine_skipped_long_segments"] += 1
             if plan.use_frame_engine:
                 raw_path = tmp / f"raw_{idx:04d}.mp4"
-                if self._cut_source_segment(src, raw_path, scene.start, scene.end, speed, info):
+                if self._cut_source_segment(src, raw_path, source_start, source_end, speed, info):
                     ok = self._render_directed_segment(raw_path, segment_path, mood, plan, info, beat_map)
                     if ok:
                         self.last_render_meta["frame_engine_segments"] += 1
@@ -1372,8 +1632,8 @@ class UnifiedRenderEngine:
                 ok = self._render_keyframed_segment(
                     src,
                     segment_path,
-                    scene.start,
-                    scene.end,
+                    source_start,
+                    source_end,
                     vf,
                     speed,
                     plan,
@@ -1387,16 +1647,16 @@ class UnifiedRenderEngine:
                 ok = self._render_segment(
                     src,
                     segment_path,
-                    scene.start,
-                    scene.end,
+                    source_start,
+                    source_end,
                     vf,
                     speed,
                     transition_sec=transition_sec,
                 )
             if ok and segment_path.exists() and segment_path.stat().st_size > 0:
-                if previous_segment is not None and previous_scene is not None:
+                if previous_segment is not None and previous_scene is not None and planned_transition not in {"cut", "none", ""}:
                     transition_path = tmp / f"trn_{idx - 1:04d}.mp4"
-                    transition_type = director.plan_transition(previous_scene, scene, section, plan, idx)
+                    transition_type = str(shot_plan.transition if shot_plan is not None else plan.transition)
                     if self._make_directed_transition(
                         transition_path,
                         previous_segment,
@@ -1407,11 +1667,19 @@ class UnifiedRenderEngine:
                     ):
                         self.last_render_meta["frame_engine_transitions"] += 1
                         segments.append(transition_path)
-                    elif self._make_transition_clip(
+                    elif transition_type in {"impact_cut", "flash_cut"} and self._make_transition_clip(
                         transition_path,
                         mood,
                         info,
-                        transition_type="flash" if transition_type in {"impact_cut", "flash_cut"} else "whip",
+                        transition_type="flash",
+                        duration=max(0.05, plan.transition_frames / max(1.0, float(info.get("fps", 30.0)))),
+                    ):
+                        segments.append(transition_path)
+                    elif transition_type in {"whip_pan_right", "whip_pan_up"} and self._make_transition_clip(
+                        transition_path,
+                        mood,
+                        info,
+                        transition_type="whip",
                         duration=max(0.05, plan.transition_frames / max(1.0, float(info.get("fps", 30.0)))),
                     ):
                         segments.append(transition_path)
@@ -1421,10 +1689,6 @@ class UnifiedRenderEngine:
                 previous_scene = scene
             elif not ok:
                 _log(f"segment {idx:04d} render failed; skipping", "WARN")
-            if heavy and is_peak and bool(style.get("flash", True)):
-                flash_path = tmp / f"flash_{idx:04d}.mp4"
-                if self._make_flash(flash_path, mood, info):
-                    segments.append(flash_path)
         return segments
 
     def _make_taste_filter(self, style: dict[str, Any]) -> Any:
@@ -2145,6 +2409,7 @@ class ArchiveEliteBrain:
         style: dict[str, Any] | None = None,
         intensity: int = 3,
         crf: int = 17,
+        audio_features: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         del prompt, crf
         started = time.time()
@@ -2154,27 +2419,25 @@ class ArchiveEliteBrain:
         info = _fit_render_info(_probe(video_path))
         duration = float(info["dur"])
 
-        if music_path and Path(str(music_path)).exists():
+        if isinstance(audio_features, dict) and audio_features.get("ok"):
+            beat_map = self._beat_map_from_audio_features(audio_features, duration)
+        elif music_path and Path(str(music_path)).exists():
             beat_map = self.music_analyzer.analyze(music_path)
         elif beat_markers:
             beat_map = self._beats_to_map(beat_markers, duration)
         else:
             beat_map = self.music_analyzer._fallback_beats(video_path)
 
-        cut_points = self._build_cut_points(
-            list(beat_map.get("beats", [])),
-            duration,
-            mood,
-            intensity,
-            style,
-        )
-        scenes: list[SceneRead] = []
-        for idx in range(len(cut_points) - 1):
-            start = float(cut_points[idx])
-            end = float(cut_points[idx + 1])
-            if end - start < 0.1:
-                continue
-            scenes.append(self.scene_engine.analyze_segment(video_path, start, end))
+        scenes = self.scene_engine.build_shot_database(video_path)
+        if not scenes:
+            cut_points = self._build_cut_points(
+                list(beat_map.get("beats", [])), duration, mood, intensity, style
+            )
+            scenes = [
+                self.scene_engine.analyze_segment(video_path, float(start), float(end))
+                for start, end in zip(cut_points, cut_points[1:])
+                if end - start >= 0.1
+            ]
         if not scenes:
             return {"ok": False, "duration": 0.0, "reason": "no_scenes"}
         max_edit_value = max(scene.edit_value for scene in scenes) or 1.0
@@ -2225,6 +2488,33 @@ class ArchiveEliteBrain:
             "scene_types": [scene.scene_type for scene in scenes[:10]],
             "drops": beat_map.get("drop_times", []),
             "render_meta": meta,
+        }
+
+    @staticmethod
+    def _beat_map_from_audio_features(features: dict[str, Any], video_duration: float) -> dict[str, Any]:
+        music = features.get("music_timeline") or {}
+        beats = [float(t) for t in music.get("beats", features.get("beat_times", []))]
+        curve = [item for item in (features.get("energy_curve") or []) if isinstance(item, dict)]
+        energies: list[float] = []
+        onsets: list[float] = []
+        for beat in beats:
+            point = min(curve, key=lambda item: abs(float(item.get("t", 0.0)) - beat), default={})
+            energies.append(float(np.clip(point.get("energy", 0.5), 0.0, 1.0)))
+            onsets.append(float(np.clip(point.get("onset", 0.0), 0.0, 1.0)))
+        return {
+            "bpm": float(music.get("bpm") or features.get("tempo") or 130.0),
+            "beats": beats,
+            "duration": float(video_duration),
+            "music_duration": float(music.get("duration") or 0.0),
+            "energy_curve": energies,
+            "onset_density": onsets,
+            "drop_times": [float(t) for t in music.get("drops", features.get("drops", []))],
+            "downbeats": [float(t) for t in music.get("downbeats", features.get("downbeat_times", []))],
+            "kick_times": [float(t) for t in music.get("kicks", features.get("kick_times", []))],
+            "snare_times": [float(t) for t in music.get("snares", features.get("snare_times", []))],
+            "sections": list(music.get("sections", features.get("sections", []))),
+            "repeated_patterns": list(music.get("repeated_patterns", features.get("repeated_patterns", []))),
+            "music_timeline": music,
         }
 
     def _build_cut_points(
@@ -2289,6 +2579,7 @@ def run_brain_render(
     music_path: Any = None,
     beat_markers: list[float] | None = None,
     style_profile: dict[str, Any] | None = None,
+    audio_features: dict[str, Any] | None = None,
     variation_seed: int | None = None,
     target_fps: int = 30,
     tmp_dir: Any = None,
@@ -2320,6 +2611,7 @@ def run_brain_render(
         music_start=music_start,
         style=style_profile or {},
         intensity=intensity,
+        audio_features=audio_features,
     )
     result["ok"] = bool(result.get("ok", False))
     result["total_time_sec"] = result.get("elapsed_sec", 0.0)

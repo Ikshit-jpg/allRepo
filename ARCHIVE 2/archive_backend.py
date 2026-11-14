@@ -27,8 +27,13 @@ from urllib.parse import quote
 import cv2
 from flask import Flask, g, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
+from moviepy.editor import vfx as _moviepy_vfx
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
+
+# MoviePy's legacy effects module has incomplete type stubs; keep its dynamic
+# effect names available without false missing-member diagnostics.
+vfx: Any = _moviepy_vfx
 
 try:
     from flask_limiter import Limiter
@@ -306,7 +311,7 @@ logger = logging.getLogger("archive")
 # RATE LIMITING
 # =============================================================================
 
-if LIMITER_AVAILABLE and Limiter is not None:
+if LIMITER_AVAILABLE and Limiter is not None and callable(get_remote_address):
     limiter = Limiter(
         get_remote_address,
         app=app,
@@ -7151,6 +7156,7 @@ def render_video_with_pyav_pipeline(
     drop_times: list[float] | None = None,
     visual_vibe: dict[str, Any] | None = None,
     audio_features: dict[str, Any] | None = None,
+    edit_plan: dict[str, Any] | None = None,
 ) -> float:
     style = build_style_profile(prompt_text, mood)
     style = _enforce_high_energy_style(prompt_text, mood, style)
@@ -7160,6 +7166,8 @@ def render_video_with_pyav_pipeline(
     ffmpeg_available = shutil.which("ffmpeg") is not None
     style_compatible = archive_fast_render_is_compatible(style, bool(music_path)) if archive_fast_render_is_compatible else False
     can_try_archive_fast = bool(
+        edit_plan
+        and
         FAST_RENDERER_AVAILABLE
         and run_archive_fast_render
         and archive_fast_render_is_compatible
@@ -7168,7 +7176,7 @@ def render_video_with_pyav_pipeline(
         and style_compatible
     )
 
-    if can_try_archive_fast:
+    if can_try_archive_fast and callable(run_archive_fast_render):
         try:
             app.logger.info("[ARCHIVE] Attempting FFmpeg fast renderer for %s", output_path.name)
             fast_duration = float(
@@ -7183,6 +7191,7 @@ def render_video_with_pyav_pipeline(
                     style=style,
                     intensity=intensity,
                     drop_times=drop_times,
+                    edit_plan=edit_plan,
                 )
                 or 0.0
             )
@@ -7209,6 +7218,7 @@ def render_video_with_pyav_pipeline(
                 visual_vibe=visual_vibe,
                 audio_features=audio_features,
                 style_profile=style,
+                edit_plan=edit_plan,
             )
             or 0.0
         )
@@ -7217,18 +7227,37 @@ def render_video_with_pyav_pipeline(
             return pyav_duration
         app.logger.warning("[ARCHIVE] PyAV renderer returned invalid output; using FFmpeg safe fallback")
 
-    return render_video_safe_fallback(video_path, output_path, music_path=music_path)
+    return render_video_safe_fallback(
+        video_path,
+        output_path,
+        music_path=music_path,
+        edit_plan=edit_plan,
+        mood=mood,
+    )
 
 
 def render_video_safe_fallback(
     video_path: Path,
     output_path: Path,
     music_path: Path | None = None,
+    edit_plan: dict[str, Any] | None = None,
+    mood: str = "dramatic",
 ) -> float:
     """
     Minimal, resilient render path used only when advanced pipeline fails.
     Keeps API responsive instead of returning HTTP 500.
     """
+    if edit_plan and render_video_with_pyav:
+        return float(
+            render_video_with_pyav(
+                video_path=str(video_path),
+                output_path=str(output_path),
+                beat_markers=[],
+                mood=mood,
+                music_path=str(music_path) if music_path else None,
+                edit_plan=edit_plan,
+            ) or 0.0
+        )
     meta = probe_video_metadata(video_path)
     duration = min(float(meta.get("duration") or 0.0), 45.0)
     if duration <= 0:
@@ -7596,7 +7625,7 @@ def render() -> Any:
                 anime_check = {"is_anime": True, "anime_confidence": 0.5, "real_confidence": 0.5}
 
         if ARCHIVE_CONTENT_SAFETY_MODE:
-            if bool(content_check.get("is_explicit", False)):
+            if bool((content_check or {}).get("is_explicit", False)):
                 return (
                     jsonify(
                         {
@@ -7611,7 +7640,7 @@ def render() -> Any:
                 )
 
         if ARCHIVE_ANIME_ONLY_MODE:
-            if not bool(anime_check.get("is_anime", False)):
+            if not bool((anime_check or {}).get("is_anime", False)):
                 return (
                     jsonify(
                         {
@@ -7752,39 +7781,61 @@ def render() -> Any:
         )
         t2 = time.perf_counter()
         if local_track:
-            try:
-                detected_bpm, beat_markers, beat_warnings = detect_beats_from_audio_file(
-                    local_track, source_duration, mood
-                )
-            except Exception as beat_exc:
-                detected_bpm = int(MOOD_TO_BPM.get(mood, 130))
-                beat_markers = generate_beat_markers(source_duration, detected_bpm)
-                beat_warnings = [f"Beat detect fallback used ({beat_exc})."]
+            music_timeline = (audio_analysis or {}).get("music_timeline") or {}
+            beat_markers = [
+                float(beat) for beat in music_timeline.get("beats", [])
+                if 0.0 <= float(beat) <= source_duration
+            ]
+            detected_bpm = int(round(float(music_timeline.get("bpm") or (audio_analysis or {}).get("tempo") or 0.0)))
+            if not beat_markers or detected_bpm <= 0:
+                try:
+                    detected_bpm, beat_markers, beat_warnings = detect_beats_from_audio_file(
+                        local_track, source_duration, mood
+                    )
+                except Exception as beat_exc:
+                    detected_bpm = int(MOOD_TO_BPM.get(mood, 130))
+                    beat_markers = generate_beat_markers(source_duration, detected_bpm)
+                    beat_warnings = [f"Beat detect fallback used ({beat_exc})."]
+            else:
+                beat_warnings = []
             warnings.append(
                 "Selected local audio: "
                 f"{_relative_track_key(local_track)} | visual mood={track_selection.get('visual_vibe', {}).get('visual_mood')} "
                 f"| target tempo={track_selection.get('target_tempo')}"
             )
         else:
-            try:
-                detected_bpm, _, beat_markers, beat_warnings = detect_beats_with_librosa(input_path, mood)
-                if audio_analysis is None:
-                    try:
-                        audio_analysis = analyze_audio_features(input_path, duration_sec=min(60.0, max(12.0, source_duration)))
-                    except Exception:
-                        audio_analysis = None
-            except Exception as beat_exc:
-                detected_bpm = int(MOOD_TO_BPM.get(mood, 130))
-                safe_duration = float(source_duration or probe_video_metadata(input_path).get("duration") or 0.0)
-                beat_markers = generate_beat_markers(safe_duration, detected_bpm)
-                beat_warnings = [f"Video-audio beat fallback used ({beat_exc})."]
+            if audio_analysis is None:
+                try:
+                    audio_analysis = analyze_audio_features(input_path, duration_sec=min(60.0, max(12.0, source_duration)))
+                except Exception:
+                    audio_analysis = None
+            music_timeline = (audio_analysis or {}).get("music_timeline") or {}
+            beat_markers = [
+                float(beat) for beat in music_timeline.get("beats", [])
+                if 0.0 <= float(beat) <= source_duration
+            ]
+            detected_bpm = int(round(float(music_timeline.get("bpm") or (audio_analysis or {}).get("tempo") or 0.0)))
+            if not beat_markers or detected_bpm <= 0:
+                try:
+                    detected_bpm, _, beat_markers, beat_warnings = detect_beats_with_librosa(input_path, mood)
+                except Exception as beat_exc:
+                    detected_bpm = int(MOOD_TO_BPM.get(mood, 130))
+                    safe_duration = float(source_duration or probe_video_metadata(input_path).get("duration") or 0.0)
+                    beat_markers = generate_beat_markers(safe_duration, detected_bpm)
+                    beat_warnings = [f"Video-audio beat fallback used ({beat_exc})."]
+            else:
+                beat_warnings = []
             warnings.append("No local music track selected; synced to video audio.")
         t_beats = time.perf_counter() - t2
         warnings.extend(beat_warnings)
 
         edit_actions = build_edit_actions(beat_markers, mood)
-        drop_times: list[float] = []
-        if local_track:
+        music_timeline = (audio_analysis or {}).get("music_timeline") or {}
+        drop_times: list[float] = [
+            float(drop) for drop in music_timeline.get("drops", [])
+            if 0.0 < float(drop) < max(source_duration, 0.1)
+        ]
+        if local_track and not drop_times:
             drop_times = detect_music_drops(local_track, source_duration)
         if isinstance(audio_analysis, dict) and isinstance(audio_analysis.get("drops"), list):
             merged_drops = list(drop_times)
@@ -7809,12 +7860,14 @@ def render() -> Any:
         output_name = f"render_{uuid.uuid4().hex}.mp4"
         output_path = OUTPUT_DIR / output_name
         brain_meta: dict[str, Any] | None = None
+        fallback_edit_plan: dict[str, Any] | None = None
         use_brain = bool(style_profile.get("brain_render", True)) and BRAIN_RENDER_AVAILABLE
         if use_brain and not shutil.which("ffmpeg"):
             use_brain = False
             warnings.append("Brain renderer requires FFmpeg; falling back to PyAV/FFmpeg pipeline.")
         try:
-            if use_brain and run_brain_render:
+            brain_renderer = run_brain_render
+            if use_brain and callable(brain_renderer):
                 app.logger.info("[ARCHIVE] Stage 4/5: brain render pipeline")
                 _set_render_status(
                     render_id,
@@ -7825,7 +7878,7 @@ def render() -> Any:
                 )
                 brain_result = _run_with_timeout(
                     "brain_render_pipeline",
-                    lambda: run_brain_render(
+                    lambda: brain_renderer(
                         video_path=input_path,
                         output_path=output_path,
                         mood=mood,
@@ -7834,6 +7887,7 @@ def render() -> Any:
                         music_path=local_track,
                         beat_markers=beat_markers,
                         style_profile=style_profile,
+                        audio_features=audio_analysis,
                         variation_seed=variation_seed,
                         target_fps=30,
                         tmp_dir=RUNTIME_DIR / "brain_tmp",
@@ -7842,9 +7896,12 @@ def render() -> Any:
                     ARCHIVE_BRAIN_TIMEOUT_SEC,
                     app.logger,
                 )
+                render_meta = brain_result.get("render_meta", {}) if isinstance(brain_result, dict) else {}
+                candidate_plan = render_meta.get("edit_plan") if isinstance(render_meta, dict) else None
+                if isinstance(candidate_plan, dict) and isinstance(candidate_plan.get("shots"), list):
+                    fallback_edit_plan = candidate_plan
                 if isinstance(brain_result, dict) and brain_result.get("ok"):
                     render_duration = float(brain_result.get("total_time_sec", 0.0))
-                    render_meta = brain_result.get("render_meta", {}) if isinstance(brain_result, dict) else {}
                     brain_meta = {
                         "brain_quality_score": brain_result.get("quality_score"),
                         "music_drop_time": brain_result.get("music_drop_time"),
@@ -7854,23 +7911,16 @@ def render() -> Any:
                         "cinematic_director_segments": render_meta.get("cinematic_director_segments"),
                         "explainability_log": render_meta.get("director_explainability_log", []),
                         "narrative_summary": render_meta.get("director_narrative_summary", []),
+                        "edit_plan": render_meta.get("edit_plan", {}),
+                        "timeline_quality_report": render_meta.get("timeline_quality_report", {}),
                     }
 
                     _set_render_status(
                         render_id,
-                        stage="brain_render_polish",
+                        stage="brain_render_complete",
                         progress_pct=85.0,
-                        message="Applying heavy visual effects and color grading...",
+                        message="Finishing the render from the approved edit plan...",
                         done=False,
-                    )
-
-                    _apply_external_brain_polish(
-                        output_path,
-                        mood,
-                        style_profile,
-                        int(style_profile.get("intensity", 2)),
-                        logger_obj=app.logger,
-                        request_id=getattr(g, "request_id", ""),
                     )
                 else:
                     reason = brain_result.get("reason") if isinstance(brain_result, dict) else "unknown"
@@ -7897,6 +7947,7 @@ def render() -> Any:
                         drop_times=drop_times,
                         visual_vibe=unified_visual,
                         audio_features=audio_analysis,
+                        edit_plan=fallback_edit_plan,
                     )
             else:
                 render_duration = render_video_with_pyav_pipeline(
@@ -7910,6 +7961,7 @@ def render() -> Any:
                     drop_times=drop_times,
                     visual_vibe=unified_visual,
                     audio_features=audio_analysis,
+                    edit_plan=fallback_edit_plan,
                 )
         except OSError as render_os_exc:
             app.logger.error(
@@ -7921,6 +7973,8 @@ def render() -> Any:
                 input_path,
                 output_path,
                 music_path=local_track,
+                edit_plan=fallback_edit_plan,
+                mood=mood,
             )
         t_render = time.perf_counter() - t3
         app.logger.info("[ARCHIVE] Stage 5/5: done")

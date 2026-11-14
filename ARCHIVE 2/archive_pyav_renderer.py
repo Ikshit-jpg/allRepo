@@ -394,11 +394,51 @@ def _plan_segments(
     cfg:          dict,
     target_dur:   float,
     seed:         int,
+    edit_plan:    Optional[Dict[str, Any]] = None,
 ) -> List[dict]:
     """
     Returns a list of segment dicts:
       start, end, speed, fade_in, fade_out, out_dur
     """
+    if edit_plan and isinstance(edit_plan.get("shots"), list):
+        planned: List[dict] = []
+        for shot in edit_plan["shots"]:
+            if not isinstance(shot, dict):
+                continue
+            start = max(0.0, float(shot.get("source_start", shot.get("start", 0.0))))
+            end = min(float(video_dur), float(shot.get("source_end", shot.get("end", 0.0))))
+            speed = max(0.05, min(8.0, float(shot.get("playback_speed", shot.get("speed", 1.0)) or 1.0)))
+            if end <= start:
+                continue
+            out_dur = float(shot.get("output_duration") or ((end - start) / speed))
+            out_dur = max(0.05, min(out_dur, max(0.05, target_dur - sum(item["out_dur"] for item in planned))))
+            if not math.isfinite(out_dur):
+                continue
+            transition = str(shot.get("transition") or "cut")
+            transition_fade = min(0.10, out_dur * 0.12) if transition in {"fade_black", "dissolve"} else 0.0
+            planned.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "speed": speed,
+                    "is_drop": bool(shot.get("is_drop", False)),
+                    "fade_in": transition_fade,
+                    "fade_out": transition_fade,
+                    "out_dur": out_dur,
+                    "plan_driven": True,
+                    "effects": list(shot.get("effects") or []),
+                    "render_operations": list(shot.get("render_operations") or []),
+                    "transition": transition,
+                    "animation": dict(shot.get("animation") or {}),
+                    "color_grade": dict(shot.get("color_grade") or {}),
+                    "creative_intent": str(shot.get("creative_intent") or "transition"),
+                }
+            )
+            if sum(item["out_dur"] for item in planned) >= target_dur:
+                break
+        if planned:
+            return planned
+
     rng = random.Random(seed)
 
     if not beat_markers:
@@ -487,6 +527,81 @@ def _plan_segments(
             kept.append(merged)
         segments = kept[:max_segments]
     return segments
+
+
+def _edit_plan_from_fallback_segments(
+    segments: List[dict],
+    beat_markers: List[float],
+    drop_times: List[float],
+    mood: str,
+    style: Dict[str, Any],
+    audio_features: Optional[dict],
+) -> Dict[str, Any]:
+    """Normalize the legacy fallback planner output before any renderer executes it."""
+    effect_aliases = {
+        "zoom": "zoom_pulse",
+        "ken_burns": "ken_burns_slow",
+        "shake": "handheld_shake",
+        "glitch": "rgb_split",
+        "chroma_pulse": "rgb_split",
+        "glow": "glow",
+        "edge_glow": "glow",
+        "energy_aura": "energy_aura",
+        "grain": "grain",
+        "fire_lines": "fire_lines",
+        "particles": "particles",
+        "flash": "flash",
+        "vignette": "vignette",
+        "speed_ramp": "zoom_pulse",
+    }
+    operations = [
+        {"name": effect_name, "strength": float(np.clip(style.get("intensity", 2) / 5.0, 0.1, 1.0))}
+        for flag, effect_name in effect_aliases.items() if bool(style.get(flag, False))
+    ]
+    music = (audio_features or {}).get("music_timeline") or {}
+    beats = [float(t) for t in (music.get("beats") or beat_markers or [])]
+    downbeats = [float(t) for t in music.get("downbeats", (audio_features or {}).get("downbeat_times", []))]
+    drops = [float(t) for t in (music.get("drops") or drop_times or [])]
+    shots: List[dict] = []
+    output_start = 0.0
+    for segment in segments:
+        start, end = float(segment["start"]), float(segment["end"])
+        section = next((item for item in music.get("sections", []) if item.get("start", 0) <= start < item.get("end", 0)), {})
+        shot_beats = [beat for beat in beats if start <= beat <= end]
+        is_drop = bool(segment.get("is_drop")) or any(abs(start - drop) <= 0.55 for drop in drops)
+        transition = str(segment.get("transition") or ("flash_cut" if is_drop else "cut"))
+        color_strength = float(np.clip(style.get("intensity", 2) / 5.0, 0.0, 1.0))
+        shots.append(
+            {
+                "source_start": start,
+                "source_end": end,
+                "output_start": output_start,
+                "output_duration": float(segment["out_dur"]),
+                "playback_speed": float(segment["speed"]),
+                "beat_times": shot_beats,
+                "is_downbeat": any(abs(beat - downbeat) <= 0.08 for beat in shot_beats for downbeat in downbeats),
+                "is_drop": is_drop,
+                "music_section": str(section.get("label") or "unknown"),
+                "music_relation": "downbeat" if any(abs(beat - downbeat) <= 0.08 for beat in shot_beats for downbeat in downbeats) else "beat" if shot_beats else "off_beat",
+                "creative_intent": "impact" if is_drop else str(section.get("label") or "transition"),
+                "effects": [{"name": name, "strength": operation["strength"]} for operation in operations for name in [operation["name"]]],
+                "render_operations": operations,
+                "transition": transition,
+                "animation": {"name": "", "strength": 0.0},
+                "color_grade": {"mood": mood, "strength": color_strength},
+                "explanation": ["Fallback planner", "Music drop" if is_drop else "Beat-aligned timeline"],
+                "visual_features": {},
+                "source_id": f"{start:.4f}:{end:.4f}",
+            }
+        )
+        output_start += float(segment["out_dur"])
+    return {
+        "version": 1,
+        "source_video": "",
+        "music_timeline": music or {"beats": beats, "downbeats": downbeats, "drops": drops},
+        "quality_report": {},
+        "shots": shots,
+    }
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -728,7 +843,14 @@ def _fallback_ffmpeg_copy(
     output_path: str | Path,
     music_path: str | Path | None = None,
     target_dur: float = 45.0,
+    edit_plan: Optional[Dict[str, Any]] = None,
 ) -> float:
+    if edit_plan:
+        plan_duration = _render_edit_plan_ffmpeg(video_path, output_path, music_path, edit_plan)
+        if plan_duration > 0:
+            return plan_duration
+        log.error("[PyAV] plan-aware FFmpeg fallback failed; preserving plan was not possible")
+        return 0.0
     target = min(max(0.1, float(target_dur or 45.0)), 60.0)
     tmp_video = Path(output_path).with_name(f"{Path(output_path).stem}_ffmpeg_video.mp4")
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
@@ -774,6 +896,126 @@ def _fallback_ffmpeg_copy(
             pass
 
 
+def _render_edit_plan_ffmpeg(
+    video_path: str | Path,
+    output_path: str | Path,
+    music_path: str | Path | None,
+    edit_plan: Dict[str, Any],
+) -> float:
+    """Execute the normalized shot decisions when PyAV is unavailable."""
+    plan = edit_plan.to_dict() if hasattr(edit_plan, "to_dict") else edit_plan
+    shots = plan.get("shots") if isinstance(plan, dict) else None
+    if not isinstance(shots, list) or not shots:
+        return 0.0
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="archive_plan_ffmpeg_", dir=str(out.parent)))
+    segment_files: list[Path] = []
+    target_dur = 0.0
+    try:
+        source_probe = _probe_duration(video_path)
+        for idx, shot in enumerate(shots):
+            if not isinstance(shot, dict):
+                continue
+            start = max(0.0, float(shot.get("source_start", shot.get("start", 0.0))))
+            end = min(source_probe, float(shot.get("source_end", shot.get("end", 0.0))))
+            speed = max(0.05, min(8.0, float(shot.get("playback_speed", shot.get("speed", 1.0)) or 1.0)))
+            if end <= start:
+                continue
+            output_duration = float(shot.get("output_duration") or ((end - start) / speed))
+            output_duration = max(0.05, output_duration)
+            filters = [f"setpts=PTS/{speed:.6f}", "scale='min(1280,iw)':-2", "fps=30"]
+            grade = shot.get("color_grade") or {}
+            grade_strength = float(np.clip(grade.get("strength", 0.0) or 0.0, 0.0, 1.0))
+            if grade_strength > 0.0:
+                mood = str(grade.get("mood") or "dramatic")
+                contrast = 1.0 + grade_strength * (0.22 if mood in {"hype", "dramatic"} else 0.14)
+                saturation = 1.0 + grade_strength * (0.22 if mood in {"hype", "chill"} else -0.08)
+                filters.append(f"eq=contrast={contrast:.3f}:saturation={saturation:.3f}")
+
+            for operation in shot.get("render_operations") or []:
+                if not isinstance(operation, dict):
+                    continue
+                name = str(operation.get("name") or "")
+                strength = float(np.clip(operation.get("strength", 0.35) or 0.35, 0.05, 1.0))
+                if name in {"impact_flash_combo", "impact_frame"}:
+                    px = max(2, int(8 * strength))
+                    filters.append(f"eq=brightness={0.08 * strength:.4f}:enable='lt(t,0.055)'")
+                    filters.append(f"rgbashift=rh={px}:bh=-{px}:enable='between(t,0,0.14)'")
+                elif name in {"speed_blur_lines", "action"}:
+                    filters.append(f"unsharp=luma_msize_x=9:luma_msize_y=3:luma_amount={0.5 + strength * 0.6:.3f}")
+                elif name in {"energy_aura", "dark_surge", "atmospheric_grade"}:
+                    filters.append(f"eq=contrast={1.0 + 0.12 * strength:.3f}:saturation={1.0 + 0.16 * strength:.3f}")
+                elif name in {"portrait_enhance", "emotional_peak"}:
+                    filters.append(f"eq=brightness={0.02 * strength:.4f}:saturation={1.0 + 0.12 * strength:.3f}")
+                elif name == "cinematic_grade":
+                    filters.append(f"eq=contrast={1.0 + 0.10 * strength:.3f}:saturation={1.0 + 0.08 * strength:.3f}")
+                animation = str(operation.get("animation") or "")
+                if animation in {"camera_slam", "handheld_shake"}:
+                    px = max(2, int(6 * strength))
+                    filters.append(f"crop=iw-{px * 2}:ih-{px * 2}:{px}+{px}*sin(t*58):{px},scale='min(1280,iw)':-2")
+                elif animation in {"push_in_slow", "parallax_zoom", "zoom_pulse", "ken_burns_slow", "subtle_drift", "orbit_right"}:
+                    filters.append("zoompan=z='min(1.08,1+0.04*on/30)':d=1:fps=30")
+
+            transition = str(shot.get("transition") or "cut")
+            if transition in {"fade_black", "dissolve"}:
+                fade = min(0.10, output_duration * 0.12)
+                filters.append(f"fade=t=in:st=0:d={fade:.3f}")
+                filters.append(f"fade=t=out:st={max(0.0, output_duration - fade):.3f}:d={fade:.3f}")
+            elif transition in {"flash_cut", "impact_cut"}:
+                filters.append("eq=brightness=0.12:enable='lt(t,0.05)'")
+            elif transition == "glitch_cut":
+                filters.append("rgbashift=rh=5:bh=-5:enable='lt(t,0.12)'")
+
+            segment_path = temp_dir / f"shot_{idx:04d}.mp4"
+            command = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{start:.4f}", "-t", f"{end - start:.4f}", "-i", str(video_path),
+                "-vf", ",".join(filters), "-an", "-t", f"{output_duration:.4f}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "21", "-pix_fmt", "yuv420p",
+                str(segment_path),
+            ]
+            ok, err = _run_subprocess(command, timeout=max(60, int(output_duration * 8)))
+            if not ok or not segment_path.exists() or segment_path.stat().st_size <= 0:
+                log.error(f"[PyAV] plan fallback segment {idx} failed: {err}")
+                return 0.0
+            segment_files.append(segment_path)
+            target_dur += output_duration
+            if target_dur >= 60.0:
+                target_dur = 60.0
+                break
+        if not segment_files:
+            return 0.0
+
+        list_file = temp_dir / "segments.txt"
+        with list_file.open("w", encoding="utf-8") as handle:
+            for segment in segment_files:
+                handle.write(f"file '{str(segment).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+        silent_video = temp_dir / "planned_video.mp4"
+        concat_ok, concat_error = _run_subprocess(
+            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(list_file), "-t", f"{target_dur:.3f}", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", str(silent_video)],
+            timeout=max(120, int(target_dur * 8)),
+        )
+        if not concat_ok:
+            log.error(f"[PyAV] plan fallback concat failed: {concat_error}")
+            return 0.0
+        if not _finalize_with_ffmpeg(silent_video, output_path, music_path, target_dur):
+            return 0.0
+        valid, reason = _validate_output_media(
+            output_path, target_dur, require_audio=bool(music_path and Path(str(music_path)).exists())
+        )
+        if not valid:
+            log.error(f"[PyAV] plan fallback output invalid: {reason}")
+            return 0.0
+        return _probe_duration(output_path) or target_dur
+    except Exception as exc:
+        log.exception(f"[PyAV] plan-aware FFmpeg fallback error: {exc}")
+        return 0.0
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def render_video_with_pyav(
     video_path:     str,
     output_path:    str,
@@ -783,9 +1025,10 @@ def render_video_with_pyav(
     prompt_text:    str                  = '',
     variation_seed: Optional[int]        = None,
     drop_times:     Optional[List[float]] = None,
-    visual_vibe:    Optional[str]        = None,
+    visual_vibe:    Optional[Dict[str, Any]] = None,
     audio_features: Optional[dict]       = None,
     style_profile:  Optional[dict]       = None,
+    edit_plan:       Optional[Dict[str, Any]] = None,
 ) -> float:
     """
     PyAV-based video renderer.
@@ -800,13 +1043,15 @@ def render_video_with_pyav(
         import av
     except ImportError:
         log.error('[PyAV] av not installed â€” pip install av')
-        return _fallback_ffmpeg_copy(video_path, output_path, music_path)
+        return _fallback_ffmpeg_copy(video_path, output_path, music_path, edit_plan=edit_plan)
 
     t0   = time.time()
     seed = variation_seed or 42
     cfg  = MOOD_CONFIG.get(mood, _DEFAULT_CFG)
     style = dict(style_profile or {})
-    active_flags = _active_style_flags(style)
+    if edit_plan is not None and hasattr(edit_plan, "to_dict"):
+        edit_plan = edit_plan.to_dict()
+    active_flags = ["edit_plan"] if edit_plan else _active_style_flags(style)
 
     log.info(f'[PyAV] render start  mood={mood}  src={Path(video_path).name}')
     log.info(f'[PyAV] active effects: {", ".join(active_flags) if active_flags else "mood_grade, vignette"}')
@@ -835,7 +1080,7 @@ def render_video_with_pyav(
 
     except Exception as e:
         log.error(f'[PyAV] probe failed: {e}')
-        return _fallback_ffmpeg_copy(video_path, output_path, music_path)
+        return _fallback_ffmpeg_copy(video_path, output_path, music_path, edit_plan=edit_plan)
 
     src_fps     = max(1.0, min(120.0, src_fps))
     target_fps  = cfg['target_fps']
@@ -843,6 +1088,10 @@ def render_video_with_pyav(
     out_h = max(2, int(src_h) // 2 * 2)
     target_dur  = min(video_dur,
                       (max(beat_markers) + 3.0) if beat_markers else video_dur)
+    if edit_plan and isinstance(edit_plan.get("shots"), list):
+        planned_duration = sum(float(shot.get("output_duration", 0.0) or 0.0) for shot in edit_plan["shots"] if isinstance(shot, dict))
+        if planned_duration > 0.0:
+            target_dur = min(60.0, planned_duration)
     target_dur  = min(target_dur, 60.0)   # hard cap 60s
 
     log.info(f'[PyAV] src={src_w}x{src_h} {src_fps:.1f}fps {video_dur:.1f}s  '
@@ -856,7 +1105,22 @@ def render_video_with_pyav(
         cfg          = cfg,
         target_dur   = target_dur,
         seed         = seed,
+        edit_plan    = edit_plan,
     )
+    if not edit_plan:
+        edit_plan = _edit_plan_from_fallback_segments(
+            segments, beat_markers or [], drop_times or [], mood, style, audio_features
+        )
+        edit_plan["source_video"] = str(video_path)
+        segments = _plan_segments(
+            video_dur=video_dur,
+            beat_markers=beat_markers or [],
+            drop_times=drop_times or [],
+            cfg=cfg,
+            target_dur=target_dur,
+            seed=seed,
+            edit_plan=edit_plan,
+        )
     log.info(f'[PyAV] {len(segments)} segments planned')
 
     # â”€â”€ 3. BUILD AUDIO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -880,7 +1144,7 @@ def render_video_with_pyav(
         }
     except Exception as e:
         log.error(f'[PyAV] output open failed: {e}')
-        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur)
+        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur, edit_plan)
 
     # â”€â”€ 5. RENDER LOOP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Pre-compute vignette mask (cached per resolution)
@@ -933,6 +1197,18 @@ def render_video_with_pyav(
             fade_in  = seg['fade_in']
             fade_out = seg['fade_out']
             out_dur  = seg['out_dur']
+            plan_driven = bool(seg.get("plan_driven", False))
+            plan_operations = seg.get("render_operations") or seg.get("effects") or []
+            effect_names = {
+                str(operation.get("name") or "")
+                for operation in plan_operations if isinstance(operation, dict)
+            }
+            effect_strength = max(
+                (float(operation.get("strength", 0.35) or 0.35) for operation in plan_operations if isinstance(operation, dict)),
+                default=0.35,
+            )
+            animation_name = str((seg.get("animation") or {}).get("name") or "")
+            plan_intensity = max(1, int(round(effect_strength * 5)))
 
             # How many output frames this segment should produce
             seg_out_frames = max(1, int(out_dur * target_fps))
@@ -1010,41 +1286,72 @@ def render_video_with_pyav(
                         continue
 
                     # â”€â”€ APPLY EFFECTS (numpy, vectorised) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                    # 1. Contrast + brightness  (replaces lum_contrast)
-                    frame_np = apply_contrast_brightness(
-                        frame_np,
-                        contrast   = cfg['contrast'],
-                        brightness = cfg['brightness'],
-                    )
-
-                    # 2. Saturation  (replaces colorx / fl_image saturation)
-                    frame_np = apply_saturation(frame_np, cfg['saturation'])
-
-                    # 3. Vignette (pre-computed mask â€” near-zero cost)
-                    frame_np = apply_vignette(frame_np, vign_mask)
+                    if plan_driven:
+                        grade = seg.get("color_grade") or {}
+                        grade_strength = float(np.clip(grade.get("strength", 0.0) or 0.0, 0.0, 1.0))
+                        if grade_strength > 0:
+                            grade_mood = str(grade.get("mood") or mood)
+                            contrast = 1.0 + grade_strength * (0.28 if grade_mood in {"hype", "dramatic"} else 0.16)
+                            brightness = grade_strength * (6 if grade_mood in {"hype", "chill"} else -3)
+                            saturation = 1.0 + grade_strength * (0.30 if grade_mood in {"hype", "chill"} else -0.10)
+                            frame_np = apply_contrast_brightness(frame_np, contrast=contrast, brightness=brightness)
+                            frame_np = apply_saturation(frame_np, saturation)
+                        if "vignette" in effect_names:
+                            frame_np = apply_vignette(frame_np, vign_mask)
+                    else:
+                        frame_np = apply_contrast_brightness(
+                            frame_np,
+                            contrast=cfg['contrast'],
+                            brightness=cfg['brightness'],
+                        )
+                        frame_np = apply_saturation(frame_np, cfg['saturation'])
+                        frame_np = apply_vignette(frame_np, vign_mask)
 
                     local_t = out_frame_idx / max(1, target_fps)
                     global_t = pts_out / max(1, target_fps)
                     # Impact timing comes from detected musical drops/shot planning,
                     # never from a segment's position in the list.
-                    impact = bool(seg.get('is_drop', False))
+                    impact = bool(seg.get('is_drop', False)) or str(seg.get("creative_intent") or "") == "impact"
+                    transition = str(seg.get("transition") or "cut")
+                    do_zoom = (
+                        animation_name in {"push_in_slow", "parallax_zoom", "zoom_pulse", "ken_burns_slow", "subtle_drift", "orbit_right"}
+                        or bool(effect_names & {"zoom_pulse", "parallax_zoom", "ken_burns_slow", "zoom_burst_shake"})
+                        or transition == "zoom_punch"
+                    ) if plan_driven else (
+                        bool(style.get('zoom', False))
+                        or bool(style.get('ken_burns', False))
+                        or (impact and bool(style.get('speed_ramp', False)))
+                    )
+                    do_shake = (
+                        animation_name in {"camera_slam", "handheld_shake"}
+                        or bool(effect_names & {"impact_flash_combo", "energy_aura", "camera_slam", "handheld_shake"})
+                    ) if plan_driven else (
+                        bool(style.get('shake', False))
+                        or (impact and bool(style.get('motion_intensity', 0)))
+                    )
+                    do_glitch = (bool(effect_names & {"glitch", "glitch_cut", "rgb_split", "impact_flash_combo"}) or transition == "glitch_cut") if plan_driven else (bool(style.get('glitch', False)) or bool(style.get('chroma_pulse', False)))
+                    do_glow = bool(effect_names & {"energy_aura", "glow", "edge_glow"}) if plan_driven else (bool(style.get('glow', False)) or bool(style.get('edge_glow', False)) or bool(style.get('energy_aura', False)))
+                    do_grain = bool(effect_names & {"grain"}) if plan_driven else (bool(style.get('grain', False)) or bool(style.get('posterize_time', False)))
+                    do_fire = bool(effect_names & {"fire_lines", "energy_aura"}) if plan_driven else (bool(style.get('fire_lines', False)) or bool(style.get('energy_aura', False)))
+                    do_particles = bool(effect_names & {"particles"}) if plan_driven else bool(style.get('particles', False))
+                    do_flash = (bool(effect_names & {"flash", "impact_flash_combo", "flash_cut"}) or transition in {"flash_cut", "impact_cut"}) if plan_driven else bool(style.get('flash', False))
 
-                    if bool(style.get('zoom', False)) or bool(style.get('ken_burns', False)) or (impact and bool(style.get('speed_ramp', False))):
+                    if do_zoom:
                         frame_np = apply_zoom(frame_np, 1.04 + (0.04 * (0.5 + 0.5 * math.sin(local_t * math.pi))))
-                    if bool(style.get('shake', False)) or (impact and bool(style.get('motion_intensity', 0))):
-                        frame_np = apply_shake(frame_np, global_t, amount=6 + int(2 * int(style.get('intensity', 2))))
-                    if bool(style.get('glitch', False)) or bool(style.get('chroma_pulse', False)):
-                        px = 3 + int(2 * int(style.get('intensity', 2)))
+                    if do_shake:
+                        frame_np = apply_shake(frame_np, global_t, amount=6 + int(2 * (plan_intensity if plan_driven else int(style.get('intensity', 2)))) )
+                    if do_glitch:
+                        px = 3 + int(2 * (plan_intensity if plan_driven else int(style.get('intensity', 2))))
                         frame_np = apply_rgb_shift(frame_np, px)
-                    if bool(style.get('glow', False)) or bool(style.get('edge_glow', False)) or bool(style.get('energy_aura', False)):
-                        frame_np = apply_glow(frame_np, 0.22 + (0.08 * int(style.get('intensity', 2))))
-                    if bool(style.get('grain', False)) or bool(style.get('posterize_time', False)):
-                        frame_np = apply_grain(frame_np, 5.0 + (2.5 * int(style.get('intensity', 2))), grain_rng)
-                    if bool(style.get('fire_lines', False)) or bool(style.get('energy_aura', False)):
-                        frame_np = apply_fire_border(frame_np, global_t, 0.45 + (0.12 * int(style.get('intensity', 2))))
-                    if bool(style.get('particles', False)):
-                        frame_np = apply_particles(frame_np, global_t, seed + seg_idx, count=20 + 6 * int(style.get('intensity', 2)))
-                    if bool(style.get('flash', False)) and impact and local_t < 0.08:
+                    if do_glow:
+                        frame_np = apply_glow(frame_np, 0.22 + (0.08 * (plan_intensity if plan_driven else int(style.get('intensity', 2)))))
+                    if do_grain:
+                        frame_np = apply_grain(frame_np, 5.0 + (2.5 * (plan_intensity if plan_driven else int(style.get('intensity', 2)))), grain_rng)
+                    if do_fire:
+                        frame_np = apply_fire_border(frame_np, global_t, 0.45 + (0.12 * (plan_intensity if plan_driven else int(style.get('intensity', 2)))))
+                    if do_particles:
+                        frame_np = apply_particles(frame_np, global_t, seed + seg_idx, count=20 + 6 * (plan_intensity if plan_driven else int(style.get('intensity', 2))))
+                    if do_flash and local_t < 0.08:
                         frame_np = apply_flash(frame_np, 0.65 * (1.0 - local_t / 0.08))
 
                     # â”€â”€ EMIT frames_to_emit OUTPUT FRAMES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1131,10 +1438,10 @@ def render_video_with_pyav(
             Path(video_only_path).unlink(missing_ok=True)
         except Exception:
             pass
-        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur)
+        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur, edit_plan)
     if not _finalize_with_ffmpeg(video_only_path, output_path, music_path, actual_dur or target_dur):
         log.error('[PyAV] output finalize failed; using FFmpeg fallback')
-        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur)
+        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur, edit_plan)
     try:
         Path(video_only_path).unlink(missing_ok=True)
     except Exception:
@@ -1142,7 +1449,7 @@ def render_video_with_pyav(
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 2048:
         log.error('[PyAV] output file invalid â€” falling back to legacy renderer')
-        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur)
+        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur, edit_plan)
     valid_output, validation_message = _validate_output_media(
         output_path,
         actual_dur or target_dur,
@@ -1150,7 +1457,7 @@ def render_video_with_pyav(
     )
     if not valid_output:
         log.error(f"[PyAV] output integrity validation failed: {validation_message}; falling back")
-        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur)
+        return _fallback_ffmpeg_copy(video_path, output_path, music_path, target_dur, edit_plan)
 
     log.info(
         f'[PyAV] DONE  {actual_dur:.2f}s output  '
@@ -1179,7 +1486,7 @@ def _fallback_legacy_ffmpeg(
     """
     del beat_markers, mood, prompt_text, variation_seed, drop_times
     log.warning('[PyAV] Falling back to FFmpeg copy path...')
-    return _fallback_ffmpeg_copy(video_path, output_path, music_path)
+    return _fallback_ffmpeg_copy(video_path, output_path, music_path, edit_plan=edit_plan)
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

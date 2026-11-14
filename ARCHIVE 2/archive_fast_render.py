@@ -627,11 +627,21 @@ def fast_render(
     intensity: int = 3,
     crf: int = 18,
     drop_times: list[float] | None = None,
+    edit_plan: dict[str, Any] | None = None,
 ) -> float:
     del prompt_text, drop_times
     video_path = Path(video_path)
     output_path = Path(output_path)
     style = style or {}
+
+    if edit_plan:
+        try:
+            from archive_pyav_renderer import _render_edit_plan_ffmpeg
+
+            return _render_edit_plan_ffmpeg(video_path, output_path, music_path, edit_plan)
+        except Exception as exc:
+            _log(f"plan-aware fast renderer unavailable: {exc}")
+            return 0.0
 
     if not is_fast_render_compatible(style, bool(music_path)):
         return 0.0
